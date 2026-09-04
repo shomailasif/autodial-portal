@@ -325,6 +325,7 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         <div id="resultBox" style="display:none;margin-top:16px;background:#0b1220;border:1px solid #312e81;border-radius:12px;padding:16px">
           <div style="color:#a78bfa;font-weight:650;margin-bottom:10px">Customer created — give them this key:</div>
           <div id="resultDetails" style="font-size:12px;color:#94a3b8;line-height:1.8"></div>
+          <button class="btn" id="doneBtn" style="margin-top:14px">Done</button>
         </div>
       </div>
     </div>
@@ -342,6 +343,36 @@ function dashboardHtml(rows, calls = [], outbox = []) {
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
+    let autoReloadTimer = null;
+    // Auto-refresh the dashboard, but NEVER while the add-user form is open
+    // (otherwise a reload would wipe what you're typing). Re-schedules after
+    // the panel closes. Panels that should NOT trigger a refresh: also the
+    // result box stays until the user clicks Done.
+    function scheduleAutoReload(ms) {
+      if (autoReloadTimer) { clearTimeout(autoReloadTimer); autoReloadTimer = null; }
+      if ($('addPanel').style.display !== 'none') return; // form open -> no auto reload
+      autoReloadTimer = setTimeout(() => { location.reload(); }, ms || 20000);
+    }
+    function stopAutoReload() {
+      if (autoReloadTimer) { clearTimeout(autoReloadTimer); autoReloadTimer = null; }
+    }
+
+    function openAddPanel() {
+      stopAutoReload();
+      $('addPanel').style.display = 'block';
+      $('resultBox').style.display = 'none';
+      $('createMsg').textContent = '';
+      $('createBtn').disabled = false;
+      $('addPanel').scrollIntoView({ behavior: 'smooth' });
+    }
+    function closeAddPanel() {
+      $('addPanel').style.display = 'none';
+      $('resultBox').style.display = 'none';
+      $('cancelBtn').style.display = '';
+      $('createMsg').textContent = '';
+      scheduleAutoReload(20000);
+    }
+
     document.addEventListener('click', async (e) => {
       const btn = e.target.closest('button[data-action]');
       if (btn) {
@@ -351,8 +382,9 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         location.reload(); return;
       }
       if (e.target.id === 'logout') { await fetch('/logout',{method:'POST'}); location.href='/'; }
-      if (e.target.id === 'addUser') { $('addPanel').style.display='block'; $('addPanel').scrollIntoView({behavior:'smooth'}); }
-      if (e.target.id === 'cancelBtn') { $('addPanel').style.display='none'; $('resultBox').style.display='none'; $('createMsg').textContent=''; }
+      if (e.target.id === 'addUser') { openAddPanel(); }
+      if (e.target.id === 'cancelBtn') { closeAddPanel(); }
+      if (e.target.id === 'doneBtn') { closeAddPanel(); }
       if (e.target.id === 'createBtn') {
         const product = $('cProduct').value.trim();
         if (!product) { $('createMsg').textContent='Please enter what they sell.'; $('createMsg').style.color='#f87171'; return; }
@@ -372,16 +404,16 @@ function dashboardHtml(rows, calls = [], outbox = []) {
             'Access key (paste into agent):<br><code style="color:#a5f3fc">' + j.token + '</code><br><br>' +
             'Machine ID:<br><code style="color:#94a3b8">' + j.machineId + '</code>';
           $('resultBox').style.display='block';
-          $('createMsg').textContent='Created ✓'; $('createMsg').style.color='#10b981';
-          setTimeout(()=>location.reload(), 1200);
+          $('cancelBtn').style.display='none';
+          $('cProduct').value=''; $('cFields').value=''; $('cEmail').value=''; $('cPersona').value='';
+          $('createMsg').textContent='Created ✓ — copy the key, then click Done.'; $('createMsg').style.color='#10b981';
         } else {
           $('createMsg').textContent=j.error||'Error'; $('createMsg').style.color='#f87171';
           $('createBtn').disabled=false;
         }
       }
     });
-    function refresh(){ setTimeout(()=>location.reload(), 5000); }
-    refresh();
+    scheduleAutoReload(20000);
   </script>`);
 }
 
