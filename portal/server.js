@@ -158,37 +158,60 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Inline "Magic Dialer" logo — a violet→cyan phone keypad with a magic sparkle.
-// Self-contained SVG, no external image, works on any free host.
+// Inline "Magic Dialer" logo — the robot head with sound waves (matches the
+// desktop Agent Cockpit and installer icon). Self-contained SVG, no external
+// image, works on any free host.
 function logoHtml(size = 96) {
-  return `<svg width="${size}" height="${size}" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Magic Dialer logo">
+  return `<svg width="${size}" height="${size}" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Magic Dialer logo">
   <defs>
-    <linearGradient id="mdGrad" x1="0" y1="0" x2="120" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#8b5cf6"/>
-      <stop offset="1" stop-color="#06b6d4"/>
+    <linearGradient id="mdHead" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
     </linearGradient>
-    <linearGradient id="mdInner" x1="0" y1="0" x2="120" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#1e1b4b"/>
-      <stop offset="1" stop-color="#0f172a"/>
+    <linearGradient id="mdWaveC" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#0EA5E9"/>
     </linearGradient>
-    <filter id="mdGlow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="3" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    <linearGradient id="mdWaveV" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8B5CF6"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <radialGradient id="mdAura" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.5"/>
+      <stop offset="0.55" stop-color="#8B5CF6" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#0B1220" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="mdGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="mdSoft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
   </defs>
-  <rect x="4" y="4" width="112" height="112" rx="28" fill="url(#mdGrad)" filter="url(#mdGlow)"/>
-  <rect x="10" y="10" width="100" height="100" rx="22" fill="url(#mdInner)"/>
-  <g stroke="#e0e7ff" stroke-width="3" stroke-linecap="round" opacity="0.9">
-    <line x1="24" y1="88" x2="30" y2="88"/><line x1="24" y1="96" x2="34" y2="96"/>
-  </g>
-  <g fill="#c7d2fe">
-    <circle cx="46" cy="46" r="5"/><circle cx="66" cy="46" r="5"/><circle cx="86" cy="46" r="5"/>
-    <circle cx="46" cy="62" r="5"/><circle cx="66" cy="62" r="5"/><circle cx="86" cy="62" r="5"/>
-    <circle cx="46" cy="78" r="5"/><circle cx="66" cy="78" r="5"/>
-  </g>
-  <path d="M88 60l3 7 7 3-7 3-3 7-3-7-7-3 7-3z" fill="#22d3ee"/>
-  <circle cx="104" cy="30" r="7" fill="#a78bfa"/>
-  <path d="M104 25l2 3 3.5 1-2.5 2.5.5 3.5-3.5-1.5-3.5 1.5.5-3.5L100 29l3.5-1z" fill="#fff"/>
+  <rect x="8" y="8" width="496" height="496" rx="92" fill="#0F172A" stroke="#334155" stroke-width="5"/>
+  <circle cx="256" cy="272" r="175" fill="url(#mdAura)"/>
+  <path d="M 88 208 Q 58 272 88 336" stroke="url(#mdWaveC)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.95"/>
+  <path d="M 66 188 Q 26 272 66 356" stroke="url(#mdWaveV)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.6"/>
+  <path d="M 424 208 Q 454 272 424 336" stroke="url(#mdWaveC)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.95"/>
+  <path d="M 446 188 Q 486 272 446 356" stroke="url(#mdWaveV)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.6"/>
+  <line x1="256" y1="112" x2="256" y2="170" stroke="#22D3EE" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="256" cy="96" r="19" fill="#FBBF24" filter="url(#mdGlow)"/>
+  <circle cx="256" cy="96" r="7" fill="#FFFFFF" opacity="0.9"/>
+  <rect x="166" y="156" width="180" height="172" rx="58" fill="url(#mdHead)" filter="url(#mdGlow)"/>
+  <rect x="172" y="162" width="168" height="160" rx="52" fill="none" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="3"/>
+  <circle cx="213" cy="231" r="20" fill="#FFFFFF" filter="url(#mdSoft)"/>
+  <circle cx="299" cy="231" r="20" fill="#FFFFFF" filter="url(#mdSoft)"/>
+  <ellipse cx="213" cy="231" rx="9" ry="13" fill="#0B1220"/>
+  <ellipse cx="299" cy="231" rx="9" ry="13" fill="#0B1220"/>
+  <circle cx="299" cy="225" r="3" fill="#FFFFFF" opacity="0.85"/>
+  <circle cx="213" cy="225" r="3" fill="#FFFFFF" opacity="0.85"/>
+  <path d="M 224 264 Q 256 288 288 264" fill="none" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="146" cy="250" r="9" fill="#22D3EE" filter="url(#mdSoft)"/>
+  <circle cx="366" cy="250" r="9" fill="#22D3EE" filter="url(#mdSoft)"/>
+  <circle cx="146" cy="250" r="3" fill="#FFFFFF" opacity="0.9"/>
+  <circle cx="366" cy="250" r="3" fill="#FFFFFF" opacity="0.9"/>
 </svg>`;
 }
 
