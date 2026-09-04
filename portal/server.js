@@ -6,7 +6,7 @@ const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword } = require("./auth");
 
 /**
- * Admin cloud portal.
+ * Magic Dialer — admin cloud portal.
  *
  * A small dependency-free HTTP server the admin can host anywhere (free
  * cloud host). It keeps the list of customer PCs, their health, and the
@@ -149,7 +149,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
   });
 
   server.listen(port, () => {
-    console.log(`[portal] Admin cloud portal running at http://localhost:${port}`);
+    console.log(`[magic-dialer] Admin cloud portal running at http://localhost:${port}`);
   });
   return server;
 }
@@ -158,122 +158,243 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function loginHtml() {
+// Inline "Magic Dialer" logo — a violet→cyan phone keypad with a magic sparkle.
+// Self-contained SVG, no external image, works on any free host.
+function logoHtml(size = 96) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Magic Dialer logo">
+  <defs>
+    <linearGradient id="mdGrad" x1="0" y1="0" x2="120" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="mdInner" x1="0" y1="0" x2="120" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1e1b4b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+    <filter id="mdGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="4" y="4" width="112" height="112" rx="28" fill="url(#mdGrad)" filter="url(#mdGlow)"/>
+  <rect x="10" y="10" width="100" height="100" rx="22" fill="url(#mdInner)"/>
+  <g stroke="#e0e7ff" stroke-width="3" stroke-linecap="round" opacity="0.9">
+    <line x1="24" y1="88" x2="30" y2="88"/><line x1="24" y1="96" x2="34" y2="96"/>
+  </g>
+  <g fill="#c7d2fe">
+    <circle cx="46" cy="46" r="5"/><circle cx="66" cy="46" r="5"/><circle cx="86" cy="46" r="5"/>
+    <circle cx="46" cy="62" r="5"/><circle cx="66" cy="62" r="5"/><circle cx="86" cy="62" r="5"/>
+    <circle cx="46" cy="78" r="5"/><circle cx="66" cy="78" r="5"/>
+  </g>
+  <path d="M88 60l3 7 7 3-7 3-3 7-3-7-7-3 7-3z" fill="#22d3ee"/>
+  <circle cx="104" cy="30" r="7" fill="#a78bfa"/>
+  <path d="M104 25l2 3 3.5 1-2.5 2.5.5 3.5-3.5-1.5-3.5 1.5.5-3.5L100 29l3.5-1z" fill="#fff"/>
+</svg>`;
+}
+
+function pageShell(title, body, { bodyClass = "bg" } = {}) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Admin Login — AutoDial</title>
+  <title>${esc(title)}</title>
   <style>
-    body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-    .box{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px;width:320px}
-    h1{font-size:20px;margin:0 0 4px}
-    .sub{color:#94a3b8;font-size:13px;margin-bottom:20px}
-    input{width:100%;box-sizing:border-box;background:#0b1220;border:1px solid #334155;color:#e2e8f0;padding:10px;border-radius:8px;margin-bottom:14px;font-size:14px}
-    button{width:100%;background:#2563eb;color:#fff;border:0;padding:11px;border-radius:8px;cursor:pointer;font-weight:600;font-size:14px}
-    .err{color:#f87171;font-size:13px;margin-top:10px}
-  </style></head><body>
-  <div class="box">
-    <h1>AutoDial Admin</h1>
-    <div class="sub">Sign in to manage customers</div>
-    <form id="f">
-      <input type="password" id="p" placeholder="Admin password" autofocus>
-      <button type="submit">Sign in</button>
-      <div class="err" id="err" style="display:none">Wrong password. Try again.</div>
-    </form>
+    *{box-sizing:border-box}
+    body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#070a14;color:#e2e8f0;margin:0;min-height:100vh}
+    .bg{background:
+      radial-gradient(1100px 500px at 15% -10%, rgba(139,92,246,.16), transparent 60%),
+      radial-gradient(1000px 500px at 100% 0%, rgba(6,182,212,.14), transparent 55%),
+      radial-gradient(900px 600px at 50% 120%, rgba(99,102,241,.10), transparent 60%),
+      #070a14}
+    .card{background:linear-gradient(160deg,rgba(30,27,75,.72),rgba(15,23,42,.85));border:1px solid rgba(139,92,246,.25);border-radius:18px;backdrop-filter:blur(8px);box-shadow:0 20px 60px -20px rgba(0,0,0,.7)}
+    .btn{background:linear-gradient(90deg,#7c3aed,#06b6d4);color:#fff;border:0;padding:11px 16px;border-radius:12px;cursor:pointer;font-weight:600;font-size:14px;transition:transform .12s ease,box-shadow .12s ease}
+    .btn:hover{transform:translateY(-1px);box-shadow:0 8px 22px -8px rgba(124,58,237,.7)}
+    .btn:disabled{opacity:.5;cursor:default;transform:none}
+    .btn.ghost{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.25)}
+    .btn.danger{background:linear-gradient(90deg,#dc2626,#f43f5e)}
+    .badge{font-size:11px;font-weight:700;padding:3px 10px;border-radius:999px;letter-spacing:.4px;text-transform:uppercase}
+    .badge.online{background:linear-gradient(90deg,#059669,#10b981);color:#fff}
+    .badge.offline{background:#334155;color:#cbd5e1}
+    .badge.disabled{background:#475569;color:#e2e8f0}
+    .badge.voip{background:linear-gradient(90deg,#7c3aed,#a855f7);color:#fff}
+    .fade{animation:mdFade .5s ease}
+    @keyframes mdFade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  </style></head><body class="${bodyClass}">${body}</body></html>`;
+}
+
+function loginHtml() {
+  return pageShell("Magic Dialer — Admin Sign in", `
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">
+    <div class="card" style="width:360px;max-width:100%;padding:34px">
+      <div style="text-align:center;margin-bottom:22px">
+        <div style="display:inline-flex">${logoHtml(86)}</div>
+        <h1 style="margin:14px 0 2px;font-size:26px;letter-spacing:.5px;background:linear-gradient(90deg,#a78bfa,#22d3ee);-webkit-background-clip:text;background-clip:text;color:transparent">Magic Dialer</h1>
+        <div style="color:#94a3b8;font-size:13px">Cloud control center · sign in to manage</div>
+      </div>
+      <form id="f">
+        <input type="password" id="p" placeholder="Admin password" autocomplete="current-password" autofocus
+          style="width:100%;background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:13px;border-radius:12px;font-size:14px;margin-bottom:14px;outline:none">
+        <button class="btn" type="submit" style="width:100%">Sign in</button>
+        <div class="err" id="err" style="display:none;color:#f87171;font-size:13px;margin-top:12px;text-align:center">Wrong password. Try again.</div>
+      </form>
+    </div>
   </div>
   <script>
     document.getElementById('f').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const r = await fetch('/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: document.getElementById('p').value }) });
-      if (r.ok) location.href = '/';
-      else document.getElementById('err').style.display = 'block';
+      const r = await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('p').value})});
+      if (r.ok) location.href='/'; else document.getElementById('err').style.display='block';
     });
-  </script>
-  </body></html>`;
+  </script>`);
 }
 
 function dashboardHtml(rows, calls = [], outbox = []) {
+  const online = rows.filter((c) => c.status === "online" && c.disabled !== 1).length;
+  const total = rows.length;
+  const disabled = rows.filter((c) => c.disabled === 1).length;
+
   const cards = rows.map((c) => {
     const state = c.disabled === 1 ? "DISABLED" : c.status === "online" ? "ONLINE" : "OFFLINE";
     const cls = c.disabled === 1 ? "badge disabled" : c.status === "online" ? "badge online" : "badge offline";
     const lastSeen = c.last_seen ? new Date(c.last_seen).toLocaleString() : "never";
     const voip = c.voip_ready === 1
-      ? '<span class="badge online" style="background:#7c3aed">VOIP ready</span>'
-      : '<span class="badge offline" style="background:#475569">no call line</span>';
+      ? '<span class="badge voip">VOIP ready</span>'
+      : '<span class="badge offline" style="background:#1e293b;color:#94a3b8">no call line</span>';
     return `
-      <div class="card" data-token="${c.token}">
-        <div class="row">
-          <span class="machine">${esc(c.product || "Untitled customer")}</span>
+      <div class="card fade" data-token="${c.token}" style="padding:18px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <span style="font-weight:650;font-size:15px">${esc(c.product || "Untitled customer")}</span>
           <span class="${cls}">${state}</span>
         </div>
-        <div class="row">
-          <span style="color:#94a3b8;font-size:12px">Call line:</span> ${voip}
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <span style="color:#94a3b8;font-size:12px">Call line</span> ${voip}
         </div>
-        <div class="meta">
+        <div style="font-size:12px;color:#94a3b8;line-height:1.7;margin-bottom:14px">
           <div>Email: ${esc(c.contact_email || "—")}</div>
           <div>Agent: ${esc(c.persona || "—")}</div>
-          <div>Lead info needed: ${esc((safeParse(c.lead_fields) || []).join(", ") || "—")}</div>
+          <div>Lead info: ${esc((safeParse(c.lead_fields) || []).join(", ") || "—")}</div>
           <div>Last heartbeat: ${lastSeen}</div>
         </div>
-        <div class="row">
+        <div style="display:flex;gap:8px">
           ${c.disabled === 1
-            ? `<button class="btn" data-action="enable" data-token="${c.token}">Enable</button>`
-            : `<button class="btn danger" data-action="disable" data-token="${c.token}">Disable</button>`}
+            ? `<button class="btn ghost" data-action="enable" data-token="${c.token}" style="flex:1">Enable</button>`
+            : `<button class="btn ghost" data-action="disable" data-token="${c.token}" style="flex:1">Disable</button>`}
         </div>
       </div>`;
   }).join("");
 
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AutoDial Admin</title>
-  <style>
-    body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px}
-    h1{font-size:22px;margin:0 0 4px}
-    .sub{color:#94a3b8;font-size:13px;margin-bottom:20px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
-    .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px}
-    .row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0}
-    .machine{font-weight:600}
-    .badge{font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px}
-    .online{background:#15803d;color:#fff}.offline{background:#b91c1c;color:#fff}.disabled{background:#475569;color:#e2e8f0}
-    .meta{font-size:12px;color:#94a3b8;margin:10px 0;line-height:1.6}
-    .btn{background:#2563eb;color:#fff;border:0;padding:8px 14px;border-radius:8px;cursor:pointer;font-weight:600}
-    .btn.danger{background:#b91c1c}
-    .btn:disabled{opacity:.5;cursor:default}
-  </style></head><body>
-  <h1>AutoDial Admin Portal</h1>
-  <div class="sub">Free cloud control center — customer PC health &amp; remote disable</div>
-  <div style="margin-bottom:16px"><button class="btn" id="logout" style="background:#475569">Sign out</button></div>
-  <div class="grid">${cards || '<div class="card">No customers yet.</div>'}</div>
-  <h2 style="margin-top:28px;font-size:17px;color:#e2e8f0">Recent AI calls</h2>
-  <div class="grid">${callsHtml(calls)}</div>
-  <h2 style="margin-top:28px;font-size:17px;color:#e2e8f0">Email outbox <span style="color:#94a3b8;font-weight:400">(if no SMTP configured)</span></h2>
-  <pre style="background:#0b1220;border:1px solid #1e293b;padding:16px;border-radius:12px;color:#a5f3fc;font-size:12px;white-space:pre-wrap">${outbox.length ? outbox.map(o => `— ${esc(o.file)}\n${esc(o.content)}`).join("\n\n") : "No emails out yet."}</pre>
+  const stat = (label, value, accent) => `<div class="card" style="padding:16px;text-align:center">
+    <div style="font-size:30px;font-weight:700;color:${accent}">${value}</div>
+    <div style="color:#94a3b8;font-size:12px;margin-top:2px">${label}</div></div>`;
+
+  return pageShell("Magic Dialer — Command Center", `
+  <div style="max-width:1200px;margin:0 auto;padding:24px">
+    <header style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:22px">
+      <div style="display:flex;align-items:center;gap:14px">
+        ${logoHtml(54)}
+        <div>
+          <div style="font-size:22px;font-weight:700;letter-spacing:.5px;background:linear-gradient(90deg,#a78bfa,#22d3ee);-webkit-background-clip:text;background-clip:text;color:transparent">Magic Dialer</div>
+          <div style="color:#94a3b8;font-size:12px">Command center · customer health &amp; remote control</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="addUser" style="padding:11px 18px">+ New user</button>
+        <button class="btn ghost" id="logout">Sign out</button>
+      </div>
+    </header>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:24px">
+      ${stat("Customers", total, "#22d3ee")}
+      ${stat("Online", online, "#10b981")}
+      ${stat("Disabled", disabled, disabled > 0 ? "#f43f5e" : "#475569")}
+    </div>
+
+    <div id="addPanel" style="display:none;margin-bottom:24px">
+      <div class="card" style="padding:20px">
+        <div style="font-size:16px;font-weight:650;margin-bottom:4px">Add a new customer</div>
+        <div style="color:#94a3b8;font-size:12px;margin-bottom:16px">Create an account for a customer. You'll get a key to pass to them — the Magic Dialer agent on their PC uses it to connect.</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
+          <input id="cProduct" placeholder="What do they sell? e.g. Premium solar panels" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
+          <input id="cFields" placeholder="Lead info needed, comma-separated (name, phone, budget)" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
+          <input id="cEmail" placeholder="Email for qualified leads" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
+          <input id="cPersona" placeholder="Agent persona (optional)" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
+        </div>
+        <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+          <button class="btn" id="createBtn">Create customer</button>
+          <button class="btn ghost" id="cancelBtn">Cancel</button>
+          <span id="createMsg" style="font-size:13px"></span>
+        </div>
+        <div id="resultBox" style="display:none;margin-top:16px;background:#0b1220;border:1px solid #312e81;border-radius:12px;padding:16px">
+          <div style="color:#a78bfa;font-weight:650;margin-bottom:10px">Customer created — give them this key:</div>
+          <div id="resultDetails" style="font-size:12px;color:#94a3b8;line-height:1.8"></div>
+        </div>
+      </div>
+    </div>
+
+    <h2 style="font-size:16px;font-weight:650;margin:0 0 12px;color:#c7d2fe">Customers</h2>
+    <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px">
+      ${cards || '<div class="card fade" style="padding:20px;color:#94a3b8">No customers yet. Click "New user" to add your first one.</div>'}
+    </div>
+
+    <h2 style="font-size:16px;font-weight:650;margin:26px 0 12px;color:#c7d2fe">Recent AI calls</h2>
+    <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px">${callsHtml(calls)}</div>
+
+    <h2 style="font-size:16px;font-weight:650;margin:26px 0 12px;color:#c7d2fe">Email outbox <span style="color:#94a3b8;font-weight:400;font-size:12px">(if no SMTP configured)</span></h2>
+    <pre style="background:#0b1220;border:1px solid #1e293b;padding:16px;border-radius:12px;color:#a5f3fc;font-size:12px;white-space:pre-wrap;overflow:auto">${outbox.length ? outbox.map(o => `— ${esc(o.file)}\n${esc(o.content)}`).join("\n\n") : "No emails out yet."}</pre>
+  </div>
   <script>
+    const $ = (id) => document.getElementById(id);
     document.addEventListener('click', async (e) => {
       const btn = e.target.closest('button[data-action]');
       if (btn) {
         btn.disabled = true;
         const body = { token: btn.dataset.token, disabled: btn.dataset.action === 'disable' };
-        await fetch('/api/disable', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-        location.reload();
-        return;
+        await fetch('/api/disable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        location.reload(); return;
       }
-      if (e.target.id === 'logout') { await fetch('/logout', { method:'POST' }); location.href = '/'; }
+      if (e.target.id === 'logout') { await fetch('/logout',{method:'POST'}); location.href='/'; }
+      if (e.target.id === 'addUser') { $('addPanel').style.display='block'; $('addPanel').scrollIntoView({behavior:'smooth'}); }
+      if (e.target.id === 'cancelBtn') { $('addPanel').style.display='none'; $('resultBox').style.display='none'; $('createMsg').textContent=''; }
+      if (e.target.id === 'createBtn') {
+        const product = $('cProduct').value.trim();
+        if (!product) { $('createMsg').textContent='Please enter what they sell.'; $('createMsg').style.color='#f87171'; return; }
+        $('createBtn').disabled = true;
+        const body = {
+          product,
+          leadFields: $('cFields').value.split(',').map(s=>s.trim()).filter(Boolean),
+          contactEmail: $('cEmail').value.trim(),
+          persona: $('cPersona').value.trim() || 'High-energy, friendly assistant'
+        };
+        const r = await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        const j = await r.json();
+        if (r.ok) {
+          const portal = location.origin;
+          $('resultDetails').innerHTML =
+            'Portal URL (agent connects here):<br><code style="color:#a5f3fc">' + portal + '</code><br><br>' +
+            'Access key (paste into agent):<br><code style="color:#a5f3fc">' + j.token + '</code><br><br>' +
+            'Machine ID:<br><code style="color:#94a3b8">' + j.machineId + '</code>';
+          $('resultBox').style.display='block';
+          $('createMsg').textContent='Created ✓'; $('createMsg').style.color='#10b981';
+          setTimeout(()=>location.reload(), 1200);
+        } else {
+          $('createMsg').textContent=j.error||'Error'; $('createMsg').style.color='#f87171';
+          $('createBtn').disabled=false;
+        }
+      }
     });
-    function refresh(){ setTimeout(()=>location.reload(), 4000); }
+    function refresh(){ setTimeout(()=>location.reload(), 5000); }
     refresh();
-  </script>
-  </body></html>`;
+  </script>`);
 }
 
 function callsHtml(calls) {
-  if (!calls.length) return '<div class="card" style="color:#94a3b8">No calls yet.</div>';
+  if (!calls.length) return '<div class="card fade" style="padding:18px;color:#94a3b8">No calls yet.</div>';
   return calls.map((c) => {
     const ok = c.good_lead === 1;
-    return `<div class="card">
-      <div class="row"><span class="machine">${esc(c.product || "call")}</span>
-      <span class="${ok ? "badge online" : "badge offline"}">${ok ? "QUALIFIED" : c.escalated === 1 ? "ESCALATED" : "no lead"}</span></div>
-      <div class="meta">Score: ${c.score}<br>${esc(String(c.summary || "").slice(0, 160))}</div>
+    return `<div class="card fade" style="padding:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-weight:600">${esc(c.product || "call")}</span>
+        <span class="${ok ? "badge online" : "badge offline"}">${ok ? "QUALIFIED" : c.escalated === 1 ? "ESCALATED" : "no lead"}</span>
+      </div>
+      <div style="font-size:12px;color:#94a3b8;line-height:1.6">Score: ${c.score}<br>${esc(String(c.summary || "").slice(0, 160))}</div>
     </div>`;
   }).join("");
 }
@@ -287,7 +408,7 @@ function safeParse(s) {
 if (require.main === module) {
   const port = Number(process.env.AUTODIAL_PORT || process.env.PORT || process.argv[2] || 8787);
   start({ port }).catch((err) => {
-    console.error("[portal] failed to start:", err);
+    console.error("[magic-dialer] failed to start:", err);
     process.exit(1);
   });
 }
