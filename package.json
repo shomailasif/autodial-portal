@@ -1,0 +1,16 @@
+{
+  "name": "autodial-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AutoDial admin cloud portal - free, dependency-free Node server",
+  "main": "portal/server.js",
+  "scripts": {
+    "start": "node portal/server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  }
+}
