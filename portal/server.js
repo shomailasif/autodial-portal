@@ -1,4 +1,5 @@
 const http = require("node:http");
+const fs = require("node:fs");
 const path = require("node:path");
 const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls } = require("./db");
 const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("../shared/protocol");
@@ -143,6 +144,24 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const rows = await allCustomers(db);
       const calls = await allCalls(db, 10);
       return send(200, dashboardHtml(rows, calls, listOutbox()));
+    }
+
+    // --- Installer download (public) ---
+    if (url.pathname === "/download/setup" && method === "GET") {
+      try {
+        const file = path.join(__dirname, "..", "MagicDialer-Setup.exe");
+        const stat = fs.statSync(file);
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": stat.size,
+          "Content-Disposition": 'attachment; filename="MagicDialer-Setup.exe"',
+          "Access-Control-Allow-Origin": "*",
+        });
+        fs.createReadStream(file).pipe(res);
+      } catch {
+        return send(404, { error: "Installer not available on this instance - use the GitHub release." });
+      }
+      return;
     }
 
     return send(404, { error: "Not found" });
