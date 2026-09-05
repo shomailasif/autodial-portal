@@ -66,6 +66,7 @@ async function openDb(dbPath) {
       score        REAL,
       good_lead    INTEGER NOT NULL DEFAULT 0,
       escalated    INTEGER NOT NULL DEFAULT 0,
+      strategies   TEXT,
       summary      TEXT,
       created_at   INTEGER NOT NULL
     );
@@ -73,6 +74,10 @@ async function openDb(dbPath) {
   const cols = db.prepare("PRAGMA table_info(customers)").all();
   if (!cols.some((c) => c.name === "voip_ready")) {
     db.exec("ALTER TABLE customers ADD COLUMN voip_ready INTEGER NOT NULL DEFAULT 0");
+  }
+  const callCols = db.prepare("PRAGMA table_info(calls)").all();
+  if (!callCols.some((c) => c.name === "strategies")) {
+    db.exec("ALTER TABLE calls ADD COLUMN strategies TEXT");
   }
   return { sqlite: db };
 }
@@ -100,6 +105,7 @@ async function initPostgres(pool) {
       score        DOUBLE PRECISION,
       good_lead    INTEGER NOT NULL DEFAULT 0,
       escalated    INTEGER NOT NULL DEFAULT 0,
+      strategies   TEXT,
       summary      TEXT,
       created_at   BIGINT NOT NULL
     );
@@ -226,18 +232,19 @@ async function allCustomers(db) {
 async function logCall(db, call) {
   const created = Date.now();
   const transcript = typeof call.transcript === "string" ? call.transcript : JSON.stringify(call.transcript || []);
+  const strategies = call.strategies ? JSON.stringify(call.strategies) : null;
   if (db.pool) {
     await db.pool.query(
-      `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, summary, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, call.summary || null, created],
+      `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, strategies, summary, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, strategies, call.summary || null, created],
     );
     return;
   }
   db.sqlite.prepare(
-    `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, summary, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, call.summary || null, created);
+    `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, strategies, summary, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, strategies, call.summary || null, created);
 }
 
 async function allCalls(db, limit = 20) {
@@ -246,6 +253,16 @@ async function allCalls(db, limit = 20) {
     return r.rows;
   }
   return db.sqlite.prepare("SELECT * FROM calls ORDER BY created_at DESC LIMIT ?").all(limit || 20);
+}
+
+async function getCallById(db, id) {
+  const n = Number(id);
+  if (!Number.isFinite(n)) return null;
+  if (db.pool) {
+    const r = await db.pool.query("SELECT * FROM calls WHERE id = $1", [n]);
+    return r.rows[0] || null;
+  }
+  return db.sqlite.prepare("SELECT * FROM calls WHERE id = ?").get(n) || null;
 }
 
 function safeParse(s) {
@@ -269,5 +286,6 @@ module.exports = {
   allCustomers,
   logCall,
   allCalls,
+  getCallById,
   USES_PG,
 };

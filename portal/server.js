@@ -1,7 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls } = require("./db");
+const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById } = require("./db");
 const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("../shared/protocol");
 const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword } = require("./auth");
@@ -107,6 +107,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
         score: body.score,
         goodLead: !!body.goodLead,
         escalateToHuman: !!body.escalateToHuman,
+        strategies: Array.isArray(body.strategies) ? body.strategies : [],
         summary: body.summary,
       });
 
@@ -129,6 +130,14 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
     if (url.pathname === "/api/calls" && method === "GET") {
       if (!isAdmin) return send(401, { error: "Admin login required" });
       return send(200, { calls: await allCalls(db, 50) });
+    }
+
+    // --- Single call with transcript (admin only) ---
+    if (url.pathname === "/api/call" && method === "GET") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const call = await getCallById(db, url.searchParams.get("id"));
+      if (!call) return send(404, { error: "Call not found" });
+      return send(200, { call });
     }
 
     // --- Outbox (admin only) ---
@@ -292,6 +301,8 @@ function dashboardHtml(rows, calls = [], outbox = []) {
   const online = rows.filter((c) => c.status === "online" && c.disabled !== 1).length;
   const total = rows.length;
   const disabled = rows.filter((c) => c.disabled === 1).length;
+  const qualifiedCalls = calls.filter((c) => c.good_lead === 1).length;
+  const avgScore = calls.length ? Math.round((calls.reduce((s, c) => s + (Number(c.score) || 0), 0) / calls.length) * 100) / 100 : 0;
 
   const cards = rows.map((c) => {
     const state = c.disabled === 1 ? "DISABLED" : c.status === "online" ? "ONLINE" : "OFFLINE";
@@ -339,14 +350,17 @@ function dashboardHtml(rows, calls = [], outbox = []) {
       </div>
       <div style="display:flex;gap:8px">
         <button class="btn" id="addUser" style="padding:11px 18px">+ New user</button>
+        <a class="btn ghost" href="/download/setup" style="text-decoration:none;padding:11px 18px">Download installer</a>
         <button class="btn ghost" id="logout">Sign out</button>
       </div>
     </header>
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:24px">
       ${stat("Customers", total, "#22d3ee")}
-      ${stat("Online", online, "#10b981")}
+      ${stat("Online now", online, "#10b981")}
       ${stat("Disabled", disabled, disabled > 0 ? "#f43f5e" : "#475569")}
+      ${stat("Qualified calls", qualifiedCalls, "#a78bfa")}
+      ${stat("Avg score", avgScore, "#fbbf24")}
     </div>
 
     <div id="addPanel" style="display:none;margin-bottom:24px">
@@ -378,7 +392,16 @@ function dashboardHtml(rows, calls = [], outbox = []) {
     </div>
 
     <h2 style="font-size:16px;font-weight:650;margin:26px 0 12px;color:#c7d2fe">Recent AI calls</h2>
-    <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px">${callsHtml(calls)}</div>
+    <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px">${callsHtml(calls)}</div>
+    <div id="modal" class="modal" style="position:fixed;inset:0;background:rgba(4,6,15,.92);display:none;align-items:center;justify-content:center;z-index:50;padding:24px">
+      <div class="card" style="width:720px;max-width:100%;max-height:86vh;display:flex;flex-direction:column;padding:0;overflow:hidden">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:18px 22px;border-bottom:1px solid rgba(139,92,246,.2)">
+          <span style="font-weight:650" id="modalTitle">Transcript</span>
+          <button class="btn ghost" id="modalClose">Close</button>
+        </div>
+        <pre id="modalBody" style="margin:0;padding:20px 22px;overflow:auto;color:#e2e8f0;font-family:Consolas,'Courier New',monospace;font-size:12.5px;line-height:1.7;white-space:pre-wrap;flex:1"></pre>
+      </div>
+    </div>
 
     <h2 style="font-size:16px;font-weight:650;margin:26px 0 12px;color:#c7d2fe">Email outbox <span style="color:#94a3b8;font-weight:400;font-size:12px">(if no SMTP configured)</span></h2>
     <pre style="background:#0b1220;border:1px solid #1e293b;padding:16px;border-radius:12px;color:#a5f3fc;font-size:12px;white-space:pre-wrap;overflow:auto">${outbox.length ? outbox.map(o => `— ${esc(o.file)}\n${esc(o.content)}`).join("\n\n") : "No emails out yet."}</pre>
@@ -393,6 +416,7 @@ function dashboardHtml(rows, calls = [], outbox = []) {
     function scheduleAutoReload(ms) {
       if (autoReloadTimer) { clearTimeout(autoReloadTimer); autoReloadTimer = null; }
       if ($('addPanel').style.display !== 'none') return; // form open -> no auto reload
+      if ($('modal').style.display === 'flex') return;   // transcript open -> no auto reload
       autoReloadTimer = setTimeout(() => { location.reload(); }, ms || 20000);
     }
     function stopAutoReload() {
@@ -415,6 +439,11 @@ function dashboardHtml(rows, calls = [], outbox = []) {
       scheduleAutoReload(20000);
     }
 
+    function formatTranscript(t) {
+      try { const arr = JSON.parse(t); if (Array.isArray(arr)) return arr.map((x) => (x.role === 'agent' ? 'AI: ' : 'LEAD: ') + x.text).join('\n'); } catch {}
+      return String(t || '');
+    }
+
     document.addEventListener('click', async (e) => {
       const btn = e.target.closest('button[data-action]');
       if (btn) {
@@ -427,6 +456,18 @@ function dashboardHtml(rows, calls = [], outbox = []) {
       if (e.target.id === 'addUser') { openAddPanel(); }
       if (e.target.id === 'cancelBtn') { closeAddPanel(); }
       if (e.target.id === 'doneBtn') { closeAddPanel(); }
+      if (e.target.id === 'modalClose' || e.target.id === 'modal') { $('modal').style.display='none'; return; }
+      if (e.target.closest('button[data-call]')) {
+        const id = e.target.closest('button[data-call]').dataset.call;
+        const r = await fetch('/api/call?id=' + id);
+        const j = await r.json();
+        if (j.call) {
+          $('modalTitle').textContent = (j.call.product || 'Call') + ' - score ' + j.call.score;
+          $('modalBody').textContent = formatTranscript(j.call.transcript);
+          $('modal').style.display = 'flex';
+        }
+        return;
+      }
       if (e.target.id === 'createBtn') {
         const product = $('cProduct').value.trim();
         if (!product) { $('createMsg').textContent='Please enter what they sell.'; $('createMsg').style.color='#f87171'; return; }
@@ -463,12 +504,19 @@ function callsHtml(calls) {
   if (!calls.length) return '<div class="card fade" style="padding:18px;color:#94a3b8">No calls yet.</div>';
   return calls.map((c) => {
     const ok = c.good_lead === 1;
+    let strategies = [];
+    if (c.strategies) { try { strategies = JSON.parse(c.strategies); } catch { strategies = []; } }
+    const chips = strategies.slice(0, 3).map((k) =>
+      `<span class="badge" style="background:rgba(139,92,246,.15);color:#c4b5fd;letter-spacing:.2px;text-transform:none">${esc(k.replace(/_/g, " "))}</span>`
+    ).join(" ");
     return `<div class="card fade" style="padding:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <span style="font-weight:600">${esc(c.product || "call")}</span>
         <span class="${ok ? "badge online" : "badge offline"}">${ok ? "QUALIFIED" : c.escalated === 1 ? "ESCALATED" : "no lead"}</span>
       </div>
-      <div style="font-size:12px;color:#94a3b8;line-height:1.6">Score: ${c.score}<br>${esc(String(c.summary || "").slice(0, 160))}</div>
+      <div style="font-size:12px;color:#94a3b8;line-height:1.6">Score: ${c.score} &middot; ${new Date(c.created_at).toLocaleString()}</div>
+      ${chips ? `<div style="display:flex;gap:6px;margin:10px 0 4px;flex-wrap:wrap">${chips}</div>` : ""}
+      <button class="btn ghost" data-call="${c.id}" style="margin-top:8px;padding:7px 12px;font-size:12px">View transcript</button>
     </div>`;
   }).join("");
 }
