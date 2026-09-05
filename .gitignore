@@ -1,6 +1,1 @@
-node_modules/
-portal.db
-*.db
-*.db-journal
-*.db-shm
-*.db-wal
+MagicDialer-Setup.exe
