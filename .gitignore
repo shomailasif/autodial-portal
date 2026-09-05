@@ -1,1 +1,4 @@
 MagicDialer-Setup.exe
+portal/*.db
+portal/*.db-shm
+portal/*.db-wal

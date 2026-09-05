@@ -1,35 +1,53 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById } = require("./db");
+const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById, updateCustomer, setCallList, saveLeads } = require("./db");
 const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("../shared/protocol");
 const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword } = require("./auth");
+const { searchLeads } = require("./find-leads");
 
 /**
- * Magic Dialer — admin cloud portal.
+ * Magic Dialer - admin cloud platform.
  *
- * A small dependency-free HTTP server the admin can host anywhere (free
- * cloud host). It keeps the list of customer PCs, their health, and the
- * disable state. The agent PC ====heartbeat===> portal on /api/heartbeat;
- * the admin watches on "/" and can disable any customer.
+ * A dependency-free HTTP server the admin can host anywhere (free cloud host).
+ * It keeps the list of customer PCs, their health, disable state, editable
+ * sales forms, call lists and internet-found leads. The agent PC
+ * ====heartbeat====> portal on /api/heartbeat; the admin works from the
+ * business-platform dashboard on "/".
  */
 
 async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, adminPassword } = {}) {
   const db = await openDb(dbPath);
 
-  // Periodically mark customers offline who stopped reporting.
   setInterval(() => { markStaleOffline(db, STALE_AFTER_MS + 2000); }, HEARTBEAT_INTERVAL_MS);
+
+  // Optional: let the platform find leads for customers on its own.
+  if (process.env.LEAD_AUTO === "1") {
+    setInterval(async () => {
+      try {
+        const rows = await allCustomers(db);
+        for (const c of rows) {
+          const want = !!(c.settings && c.settings.searchEnabled);
+          const old = (c.leads_searched_at || 0) < Date.now() - 1000 * 60 * 60 * 24;
+          if (!want || !old || !c.product) continue;
+          const leads = await searchLeads({ product: c.product, count: 10 });
+          if (leads.length) await saveLeads(db, c.token, leads);
+        }
+      } catch { /* scheduler must never crash the portal */ }
+    }, 1000 * 60 * 60 * 6);
+  }
 
   async function readBody(req) {
     let data = "";
     for await (const chunk of req) data += chunk;
-    try {
-      return JSON.parse(data || "{}");
-    } catch {
-      return {};
-    }
+    try { return JSON.parse(data || "{}"); } catch { return {}; }
   }
+
+  const match = (urlPath, pattern) => {
+    const m = String(urlPath).match(pattern);
+    return m ? { token: decodeURIComponent(m[1]) } : null;
+  };
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -44,18 +62,14 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       res.end(body);
     };
 
-    // Whether the current request has a valid admin session.
     const isAdmin = verifySession(sessionFromCookieHeader(req.headers.cookie));
 
     // --- Admin login page + handler ---
-    if (url.pathname === "/login" && method === "GET") {
-      return send(200, loginHtml());
-    }
+    if (url.pathname === "/login" && method === "GET") return send(200, loginHtml());
     if (url.pathname === "/login" && method === "POST") {
       const body = await readBody(req);
       if (checkPassword(body.password, adminPassword)) {
-        const cookie = `session=${issueSession()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`;
-        return send(200, { ok: true }, { "Set-Cookie": cookie });
+        return send(200, { ok: true }, { "Set-Cookie": `session=${issueSession()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400` });
       }
       return send(401, { error: "Wrong password" });
     }
@@ -63,16 +77,64 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       return send(200, { ok: true }, { "Set-Cookie": "session=; Path=/; HttpOnly; Max-Age=0" });
     }
 
-    // --- Heartbeat from a customer's PC (no login — the agent must work) ---
+    // --- Heartbeat from a customer's PC (no login - the agent must work) ---
     if (url.pathname === "/api/heartbeat" && method === "POST") {
       const body = await readBody(req);
       const out = await processHeartbeat(db, { token: body.token });
-      return send(200, heartbeatResponse({
-        ok: out.ok,
-        disabled: out.disabled,
-        config: out.config,
-        reason: out.reason,
-      }));
+      return send(200, heartbeatResponse({ ok: out.ok, disabled: out.disabled, config: out.config, reason: out.reason }));
+    }
+
+    // --- Customer admin actions (ADMIN ONLY) ---
+    const cmToken = match(url.pathname, /^\/api\/customer\/([^/]+)$/);
+    const cmCallList = match(url.pathname, /^\/api\/customer\/([^/]+)\/calllist$/);
+    const cmLeads = match(url.pathname, /^\/api\/customer\/([^/]+)\/leads$/);
+    const cmLeadsSearch = match(url.pathname, /^\/api\/customer\/([^/]+)\/leads\/search$/);
+    const cmLeadsRemove = match(url.pathname, /^\/api\/customer\/([^/]+)\/leads\/remove$/);
+
+    if (cmToken && method === "GET") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      return send(200, { customer: await getCustomerByToken(db, cmToken.token) });
+    }
+    if (cmToken && method === "PATCH") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const body = await readBody(req);
+      const c = await updateCustomer(db, cmToken.token, {
+        product: body.product,
+        leadFields: Array.isArray(body.leadFields) ? body.leadFields : undefined,
+        contactEmail: body.contactEmail,
+        persona: body.persona,
+        settings: body.settings,
+      });
+      return c ? send(200, { ok: true, customer: c }) : send(404, { error: "Customer not found" });
+    }
+    if (cmCallList && method === "POST") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const body = await readBody(req);
+      const c = await setCallList(db, cmCallList.token, body.numbers);
+      return c ? send(200, { ok: true, callList: c.call_list }) : send(404, { error: "Customer not found" });
+    }
+    if (cmLeads && method === "GET") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const c = await getCustomerByToken(db, cmLeads.token);
+      return c ? send(200, { leads: c.leads_found, searchedAt: c.leads_searched_at }) : send(404, { error: "Customer not found" });
+    }
+    if (cmLeadsSearch && method === "POST") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const c = await getCustomerByToken(db, cmLeadsSearch.token);
+      if (!c) return send(404, { error: "Customer not found" });
+      if (!c.product) return send(200, { leads: [], searchedAt: null, error: "Set the sales form first (no product to search for)." });
+      const leads = await searchLeads({ product: c.product, count: 12 });
+      const saved = await saveLeads(db, c.token, leads);
+      return send(200, { leads: saved.leads_found, searchedAt: saved.leads_searched_at });
+    }
+    if (cmLeadsRemove && method === "POST") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const c = await getCustomerByToken(db, cmLeadsRemove.token);
+      if (!c) return send(404, { error: "Customer not found" });
+      const body = await readBody(req);
+      const kept = (c.leads_found || []).filter((l) => l.id !== body.id);
+      const saved = await saveLeads(db, c.token, kept);
+      return send(200, { ok: true, leads: saved.leads_found });
     }
 
     // --- Disable / enable a customer (ADMIN ONLY) ---
@@ -84,7 +146,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       return send(200, { ok: true, disabled: c.disabled === 1, token: c.token });
     }
 
-    // --- Register a customer (admin flow; keep open for setup, but admin login is safer) ---
+    // --- Register a customer (ADMIN ONLY) ---
     if (url.pathname === "/api/register" && method === "POST") {
       if (!isAdmin) return send(401, { error: "Admin login required" });
       const body = await readBody(req);
@@ -94,7 +156,10 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
         contactEmail: body.contactEmail,
         persona: body.persona,
       });
-      return send(200, { ok: true, token: c.token, machineId: c.machineId, product: c.product });
+      if (body.settings && typeof body.settings === "object") await updateCustomer(db, c.token, { settings: body.settings });
+      if (Array.isArray(body.callList)) await setCallList(db, c.token, body.callList);
+      const fresh = await getCustomerByToken(db, c.token);
+      return send(200, { ok: true, token: fresh.token, machineId: fresh.machine_id, product: fresh.product, settings: fresh.settings, callList: fresh.call_list });
     }
 
     // --- Record a completed AI call (agent posts this; no login) ---
@@ -131,8 +196,6 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       if (!isAdmin) return send(401, { error: "Admin login required" });
       return send(200, { calls: await allCalls(db, 50) });
     }
-
-    // --- Single call with transcript (admin only) ---
     if (url.pathname === "/api/call" && method === "GET") {
       if (!isAdmin) return send(401, { error: "Admin login required" });
       const call = await getCallById(db, url.searchParams.get("id"));
@@ -151,7 +214,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       if (!isAdmin) return send(200, loginHtml());
       await markStaleOffline(db, STALE_AFTER_MS + 2000);
       const rows = await allCustomers(db);
-      const calls = await allCalls(db, 10);
+      const calls = await allCalls(db, 20);
       return send(200, dashboardHtml(rows, calls, listOutbox()));
     }
 
@@ -177,7 +240,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
   });
 
   server.listen(port, () => {
-    console.log(`[magic-dialer] Admin cloud portal running at http://localhost:${port}`);
+    console.log(`[magic-dialer] Platform portal running at http://localhost:${port}`);
   });
   return server;
 }
@@ -186,106 +249,95 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Inline "Magic Dialer" logo — the robot head with sound waves (matches the
-// desktop Agent Cockpit and installer icon). Self-contained SVG, no external
-// image, works on any free host.
 function logoHtml(size = 96) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Magic Dialer logo">
   <defs>
     <linearGradient id="mdHead" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#22D3EE"/>
-      <stop offset="1" stop-color="#8B5CF6"/>
-    </linearGradient>
-    <linearGradient id="mdWaveC" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#22D3EE"/>
-      <stop offset="1" stop-color="#0EA5E9"/>
-    </linearGradient>
-    <linearGradient id="mdWaveV" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#8B5CF6"/>
+      <stop offset="0" stop-color="#38BDF8"/>
       <stop offset="1" stop-color="#7C3AED"/>
     </linearGradient>
+    <linearGradient id="mdWaveC" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#0EA5E9"/>
+    </linearGradient>
     <radialGradient id="mdAura" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.5"/>
-      <stop offset="0.55" stop-color="#8B5CF6" stop-opacity="0.18"/>
+      <stop offset="0" stop-color="#38BDF8" stop-opacity="0.35"/>
       <stop offset="1" stop-color="#0B1220" stop-opacity="0"/>
     </radialGradient>
-    <filter id="mdGlow" x="-80%" y="-80%" width="260%" height="260%">
-      <feGaussianBlur stdDeviation="7" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-    <filter id="mdSoft" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur stdDeviation="3" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
   </defs>
   <rect x="8" y="8" width="496" height="496" rx="92" fill="#0F172A" stroke="#334155" stroke-width="5"/>
-  <circle cx="256" cy="272" r="175" fill="url(#mdAura)"/>
-  <path d="M 88 208 Q 58 272 88 336" stroke="url(#mdWaveC)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.95"/>
-  <path d="M 66 188 Q 26 272 66 356" stroke="url(#mdWaveV)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.6"/>
-  <path d="M 424 208 Q 454 272 424 336" stroke="url(#mdWaveC)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.95"/>
-  <path d="M 446 188 Q 486 272 446 356" stroke="url(#mdWaveV)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.6"/>
-  <line x1="256" y1="112" x2="256" y2="170" stroke="#22D3EE" stroke-width="9" stroke-linecap="round"/>
-  <circle cx="256" cy="96" r="19" fill="#FBBF24" filter="url(#mdGlow)"/>
-  <circle cx="256" cy="96" r="7" fill="#FFFFFF" opacity="0.9"/>
-  <rect x="166" y="156" width="180" height="172" rx="58" fill="url(#mdHead)" filter="url(#mdGlow)"/>
-  <rect x="172" y="162" width="168" height="160" rx="52" fill="none" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="3"/>
-  <circle cx="213" cy="231" r="20" fill="#FFFFFF" filter="url(#mdSoft)"/>
-  <circle cx="299" cy="231" r="20" fill="#FFFFFF" filter="url(#mdSoft)"/>
-  <ellipse cx="213" cy="231" rx="9" ry="13" fill="#0B1220"/>
-  <ellipse cx="299" cy="231" rx="9" ry="13" fill="#0B1220"/>
-  <circle cx="299" cy="225" r="3" fill="#FFFFFF" opacity="0.85"/>
-  <circle cx="213" cy="225" r="3" fill="#FFFFFF" opacity="0.85"/>
+  <circle cx="256" cy="272" r="170" fill="url(#mdAura)"/>
+  <path d="M 112 210 L 82 272 L 112 334" stroke="url(#mdWaveC)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.9"/>
+  <path d="M 400 210 L 430 272 L 400 334" stroke="url(#mdWaveC)" stroke-width="11" stroke-linecap="round" fill="none" opacity="0.9"/>
+  <line x1="256" y1="112" x2="256" y2="170" stroke="#38BDF8" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="256" cy="96" r="18" fill="#FBBF24"/>
+  <rect x="166" y="156" width="180" height="172" rx="58" fill="url(#mdHead)"/>
+  <circle cx="213" cy="231" r="20" fill="#FFFFFF"/><circle cx="299" cy="231" r="20" fill="#FFFFFF"/>
+  <ellipse cx="213" cy="233" rx="9" ry="13" fill="#0B1220"/><ellipse cx="299" cy="233" rx="9" ry="13" fill="#0B1220"/>
   <path d="M 224 264 Q 256 288 288 264" fill="none" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round"/>
-  <circle cx="146" cy="250" r="9" fill="#22D3EE" filter="url(#mdSoft)"/>
-  <circle cx="366" cy="250" r="9" fill="#22D3EE" filter="url(#mdSoft)"/>
-  <circle cx="146" cy="250" r="3" fill="#FFFFFF" opacity="0.9"/>
-  <circle cx="366" cy="250" r="3" fill="#FFFFFF" opacity="0.9"/>
+  <circle cx="146" cy="250" r="9" fill="#38BDF8"/><circle cx="366" cy="250" r="9" fill="#38BDF8"/>
 </svg>`;
 }
 
-function pageShell(title, body, { bodyClass = "bg" } = {}) {
+function pageShell(title, body, { bodyClass = "" } = {}) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${esc(title)}</title>
   <style>
     *{box-sizing:border-box}
-    body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#070a14;color:#e2e8f0;margin:0;min-height:100vh}
-    .bg{background:
-      radial-gradient(1100px 500px at 15% -10%, rgba(139,92,246,.16), transparent 60%),
-      radial-gradient(1000px 500px at 100% 0%, rgba(6,182,212,.14), transparent 55%),
-      radial-gradient(900px 600px at 50% 120%, rgba(99,102,241,.10), transparent 60%),
-      #070a14}
-    .card{background:linear-gradient(160deg,rgba(30,27,75,.72),rgba(15,23,42,.85));border:1px solid rgba(139,92,246,.25);border-radius:18px;backdrop-filter:blur(8px);box-shadow:0 20px 60px -20px rgba(0,0,0,.7)}
-    .btn{background:linear-gradient(90deg,#7c3aed,#06b6d4);color:#fff;border:0;padding:11px 16px;border-radius:12px;cursor:pointer;font-weight:600;font-size:14px;transition:transform .12s ease,box-shadow .12s ease}
-    .btn:hover{transform:translateY(-1px);box-shadow:0 8px 22px -8px rgba(124,58,237,.7)}
+    body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0b1020;color:#e2e8f0;margin:0;min-height:100vh}
+    .btn{display:inline-block;background:linear-gradient(90deg,#4f46e5,#0ea5e9);color:#fff;border:0;padding:9px 14px;border-radius:9px;cursor:pointer;font-weight:600;font-size:13px;text-decoration:none;transition:transform .12s ease,box-shadow .12s ease}
+    .btn:hover{transform:translateY(-1px);box-shadow:0 8px 22px -8px rgba(79,70,229,.6)}
     .btn:disabled{opacity:.5;cursor:default;transform:none}
-    .btn.ghost{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.25)}
-    .btn.danger{background:linear-gradient(90deg,#dc2626,#f43f5e)}
-    .badge{font-size:11px;font-weight:700;padding:3px 10px;border-radius:999px;letter-spacing:.4px;text-transform:uppercase}
-    .badge.online{background:linear-gradient(90deg,#059669,#10b981);color:#fff}
-    .badge.offline{background:#334155;color:#cbd5e1}
-    .badge.disabled{background:#475569;color:#e2e8f0}
-    .badge.voip{background:linear-gradient(90deg,#7c3aed,#a855f7);color:#fff}
-    .fade{animation:mdFade .5s ease}
-    @keyframes mdFade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+    .btn.ghost{background:rgba(148,163,184,.10);color:#cbd5e1;border:1px solid rgba(148,163,184,.22)}
+    .btn.danger{background:linear-gradient(90deg,#dc2626,#ef4444)}
+    .badge{display:inline-block;font-size:10.5px;font-weight:700;padding:3px 9px;border-radius:999px;letter-spacing:.3px;text-transform:uppercase}
+    .badge.online{background:rgba(16,185,129,.16);color:#34d399}
+    .badge.offline{background:rgba(148,163,184,.14);color:#94a3b8}
+    .badge.disabled{background:rgba(248,113,113,.14);color:#f87171}
+    .badge.voip{background:rgba(139,92,246,.16);color:#c4b5fd}
+    .badge.neutral{background:rgba(56,189,248,.14);color:#7dd3fc}
+    table{width:100%;border-collapse:collapse}
+    th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:#7c8aa8;font-weight:700;padding:10px 12px;border-bottom:1px solid rgba(148,163,184,.14)}
+    td{padding:12px;border-bottom:1px solid rgba(148,163,184,.08);font-size:13px;vertical-align:middle}
+    tr:hover td{background:rgba(148,163,184,.045)}
+    .card{background:linear-gradient(160deg,#171d38,#10152a);border:1px solid rgba(99,102,241,.22);border-radius:14px}
+    .modal{position:fixed;inset:0;background:rgba(4,7,18,.92);display:none;align-items:flex-start;justify-content:center;z-index:50;padding:5vh 20px;overflow:auto}
+    .inp,textarea.inp{width:100%;background:#0b1220;border:1px solid #2c3350;color:#e2e8f0;padding:10px 12px;border-radius:9px;font-size:13px;outline:none}
+    .inp:focus{border-color:#6366f1}
+    label.f{display:block;font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:#8b98b8;margin:12px 0 5px}
+    .mono{font-family:Consolas,'Courier New',monospace}
+    .fade{animation:mdFade .35s ease}
+    @keyframes mdFade{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+    a{color:#7dd3fc}
+    .nav{font-size:13px;padding:9px 12px;border-radius:9px;color:#a5b0cc;cursor:pointer;display:flex;gap:10px;align-items:center}
+    .nav.active{background:linear-gradient(90deg,rgba(79,70,229,.22),rgba(14,165,233,.12));color:#e2e8f0}
+    .nav:hover{background:rgba(148,163,184,.08)}
   </style></head><body class="${bodyClass}">${body}</body></html>`;
 }
 
 function loginHtml() {
-  return pageShell("Magic Dialer — Admin Sign in", `
+  return pageShell("Magic Dialer - Platform Console", `
   <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">
-    <div class="card" style="width:360px;max-width:100%;padding:34px">
-      <div style="text-align:center;margin-bottom:22px">
-        <div style="display:inline-flex">${logoHtml(86)}</div>
-        <h1 style="margin:14px 0 2px;font-size:26px;letter-spacing:.5px;background:linear-gradient(90deg,#a78bfa,#22d3ee);-webkit-background-clip:text;background-clip:text;color:transparent">Magic Dialer</h1>
-        <div style="color:#94a3b8;font-size:13px">Cloud control center · sign in to manage</div>
+    <div style="max-width:1120px;width:100%;display:grid;grid-template-columns:1fr 400px;gap:48px;align-items:center">
+      <div style="display:none"></div>
+      <div>
+        <div class="card fade" style="padding:38px">
+          <div style="display:flex;align-items:center;gap:14px;margin-bottom:26px">
+            ${logoHtml(52)}
+            <div>
+              <div style="font-size:20px;font-weight:700;background:linear-gradient(90deg,#a5b4fc,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent">Magic Dialer</div>
+              <div style="color:#7c8aa8;font-size:13px">Platform Console</div>
+            </div>
+          </div>
+          <form id="f">
+            <label class="f" for="p" style="margin-top:0">Admin password</label>
+            <input type="password" id="p" class="inp" placeholder="Your console password" autocomplete="current-password" autofocus>
+            <button class="btn" type="submit" style="width:100%;margin-top:16px;padding:12px">Sign in to console</button>
+            <div class="err" id="err" style="display:none;color:#f87171;font-size:13px;margin-top:12px;text-align:center">Wrong password. Try again.</div>
+          </form>
+        </div>
       </div>
-      <form id="f">
-        <input type="password" id="p" placeholder="Admin password" autocomplete="current-password" autofocus
-          style="width:100%;background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:13px;border-radius:12px;font-size:14px;margin-bottom:14px;outline:none">
-        <button class="btn" type="submit" style="width:100%">Sign in</button>
-        <div class="err" id="err" style="display:none;color:#f87171;font-size:13px;margin-top:12px;text-align:center">Wrong password. Try again.</div>
-      </form>
     </div>
   </div>
   <script>
@@ -297,233 +349,413 @@ function loginHtml() {
   </script>`);
 }
 
+function jsonSafe(v) {
+  return JSON.stringify(v).replace(/</g, "\\u003c");
+}
+
 function dashboardHtml(rows, calls = [], outbox = []) {
   const online = rows.filter((c) => c.status === "online" && c.disabled !== 1).length;
   const total = rows.length;
   const disabled = rows.filter((c) => c.disabled === 1).length;
   const qualifiedCalls = calls.filter((c) => c.good_lead === 1).length;
   const avgScore = calls.length ? Math.round((calls.reduce((s, c) => s + (Number(c.score) || 0), 0) / calls.length) * 100) / 100 : 0;
+  const leadCount = rows.reduce((s, c) => s + (c.leads_found || []).length, 0);
 
-  const cards = rows.map((c) => {
+  const stat = (label, value, accent) => `<div class="card" style="padding:15px 18px;text-align:center">
+    <div style="font-size:26px;font-weight:700;color:${accent}">${value}</div>
+    <div style="color:#7c8aa8;font-size:11px;margin-top:3px;letter-spacing:.3px">${label}</div></div>`;
+
+  const rowsTr = rows.map((c) => {
     const state = c.disabled === 1 ? "DISABLED" : c.status === "online" ? "ONLINE" : "OFFLINE";
     const cls = c.disabled === 1 ? "badge disabled" : c.status === "online" ? "badge online" : "badge offline";
     const lastSeen = c.last_seen ? new Date(c.last_seen).toLocaleString() : "never";
-    const voip = c.voip_ready === 1
-      ? '<span class="badge voip">VOIP ready</span>'
-      : '<span class="badge offline" style="background:#1e293b;color:#94a3b8">no call line</span>';
-    return `
-      <div class="card fade" data-token="${c.token}" style="padding:18px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-          <span style="font-weight:650;font-size:15px">${esc(c.product || "Untitled customer")}</span>
-          <span class="${cls}">${state}</span>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <span style="color:#94a3b8;font-size:12px">Call line</span> ${voip}
-        </div>
-        <div style="font-size:12px;color:#94a3b8;line-height:1.7;margin-bottom:14px">
-          <div>Email: ${esc(c.contact_email || "—")}</div>
-          <div>Agent: ${esc(c.persona || "—")}</div>
-          <div>Lead info: ${esc((safeParse(c.lead_fields) || []).join(", ") || "—")}</div>
-          <div>Last heartbeat: ${lastSeen}</div>
-        </div>
-        <div style="display:flex;gap:8px">
-          ${c.disabled === 1
-            ? `<button class="btn ghost" data-action="enable" data-token="${c.token}" style="flex:1">Enable</button>`
-            : `<button class="btn ghost" data-action="disable" data-token="${c.token}" style="flex:1">Disable</button>`}
-        </div>
-      </div>`;
+    const line = c.voip_ready === 1 ? '<span class="badge voip">VOIP</span>' : '<span class="badge neutral">no line</span>';
+    const company = c.settings && c.settings.companyName;
+    const leads = c.leads_found || [];
+    const callsN = (c.call_list || []).length;
+    return `<tr class="fade">
+      <td>
+        <div style="font-weight:600">${esc(c.product || "Untitled customer")}</div>
+        <div style="color:#7c8aa8;font-size:11.5px;margin-top:2px">${esc(company || "")} &middot; ${esc(c.persona || "")}</div>
+      </td>
+      <td><span class="${cls}">${state}</span></td>
+      <td>${line}</td>
+      <td><span class="badge neutral" data-token="${c.token}" data-action="calllist" style="cursor:pointer">${callsN} numbers</span></td>
+      <td><span class="badge neutral" data-token="${c.token}" data-action="leads" style="cursor:pointer">${leads.length} found</span></td>
+      <td style="color:#7c8aa8;font-size:12px">${esc(c.contact_email || "-")}</td>
+      <td style="color:#7c8aa8;font-size:12px;white-space:nowrap">${lastSeen}</td>
+      <td style="white-space:nowrap">
+        <button class="btn ghost" data-token="${c.token}" data-action="edit" style="padding:5px 10px;font-size:12px">Edit</button>
+        ${c.disabled === 1
+          ? `<button class="btn ghost" style="padding:5px 10px;font-size:12px;margin-left:4px;color:#34d399" data-token="${c.token}" data-action="enable">Enable</button>`
+          : `<button class="btn ghost danger" style="padding:5px 10px;font-size:12px;margin-left:4px" data-token="${c.token}" data-action="disable">Disable</button>`}
+      </td>
+    </tr>`;
   }).join("");
 
-  const stat = (label, value, accent) => `<div class="card" style="padding:16px;text-align:center">
-    <div style="font-size:30px;font-weight:700;color:${accent}">${value}</div>
-    <div style="color:#94a3b8;font-size:12px;margin-top:2px">${label}</div></div>`;
+  const callsTr = callsHtml(calls);
 
-  return pageShell("Magic Dialer — Command Center", `
-  <div style="max-width:1200px;margin:0 auto;padding:24px">
-    <header style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:22px">
-      <div style="display:flex;align-items:center;gap:14px">
-        ${logoHtml(54)}
+  const outboxHtml = outbox.length
+    ? outbox.map((o) => `<div class="card" style="padding:16px;margin-bottom:10px">
+        <div style="color:#7dd3fc;font-size:12px;font-weight:600;margin-bottom:6px">${esc(o.file)}</div>
+        <pre class="mono" style="margin:0;color:#cbd5e1;font-size:12px;white-space:pre-wrap;overflow:auto">${esc(o.content)}</pre></div>`).join("")
+    : '<div class="card" style="padding:16px;color:#7c8aa8;font-size:13px">No emails out yet.</div>';
+
+  return pageShell("Magic Dialer - Console", `
+  <div style="display:flex;min-height:100vh">
+    <aside style="width:230px;flex-shrink:0;background:#0d1226;border-right:1px solid rgba(99,102,241,.18);padding:20px 14px;position:sticky;top:0;height:100vh">
+      <div style="display:flex;align-items:center;gap:10px;padding:0 6px 18px;border-bottom:1px solid rgba(148,163,184,.12)">
+        ${logoHtml(40)}
         <div>
-          <div style="font-size:22px;font-weight:700;letter-spacing:.5px;background:linear-gradient(90deg,#a78bfa,#22d3ee);-webkit-background-clip:text;background-clip:text;color:transparent">Magic Dialer</div>
-          <div style="color:#94a3b8;font-size:12px">Command center · customer health &amp; remote control</div>
+          <div style="font-weight:700;font-size:15px">Magic Dialer</div>
+          <div style="color:#7c8aa8;font-size:11px">Platform Console</div>
         </div>
       </div>
-      <div style="display:flex;gap:8px">
-        <button class="btn" id="addUser" style="padding:11px 18px">+ New user</button>
-        <a class="btn ghost" href="/download/setup" style="text-decoration:none;padding:11px 18px">Download installer</a>
-        <button class="btn ghost" id="logout">Sign out</button>
+      <div style="margin-top:16px;display:flex;flex-direction:column;gap:3px">
+        <div class="nav active" data-nav="customers">Customers</div>
+        <div class="nav" data-nav="calls">AI calls</div>
+        <div class="nav" data-nav="outbox">Email outbox</div>
+        <a class="nav" href="/download/setup" style="text-decoration:none">Download installer</a>
       </div>
-    </header>
+      <div style="position:absolute;bottom:18px;left:14px;right:14px">
+        <button class="btn ghost" id="logout" style="width:100%">Sign out</button>
+      </div>
+    </aside>
 
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:24px">
-      ${stat("Customers", total, "#22d3ee")}
-      ${stat("Online now", online, "#10b981")}
-      ${stat("Disabled", disabled, disabled > 0 ? "#f43f5e" : "#475569")}
-      ${stat("Qualified calls", qualifiedCalls, "#a78bfa")}
-      ${stat("Avg score", avgScore, "#fbbf24")}
-    </div>
+    <main style="flex:1;padding:24px 30px;min-width:0">
+      <header style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h1 style="margin:0;font-size:20px;font-weight:700">Command center</h1>
+          <div style="color:#7c8aa8;font-size:13px;margin-top:2px">Customers, call lists, AI leads and call records</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" id="addUser">+ New customer</button>
+          <button class="btn ghost" id="exportCsv">Export CSV</button>
+        </div>
+      </header>
 
-    <div id="addPanel" style="display:none;margin-bottom:24px">
-      <div class="card" style="padding:20px">
-        <div style="font-size:16px;font-weight:650;margin-bottom:4px">Add a new customer</div>
-        <div style="color:#94a3b8;font-size:12px;margin-bottom:16px">Create an account for a customer. You'll get a key to pass to them — the Magic Dialer agent on their PC uses it to connect.</div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
-          <input id="cProduct" placeholder="What do they sell? e.g. Premium solar panels" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
-          <input id="cFields" placeholder="Lead info needed, comma-separated (name, phone, budget)" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
-          <input id="cEmail" placeholder="Email for qualified leads" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
-          <input id="cPersona" placeholder="Agent persona (optional)" style="background:#0b1220;border:1px solid #312e81;color:#e2e8f0;padding:12px;border-radius:12px;font-size:14px;outline:none">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px">
+        ${stat("Customers", total, "#7dd3fc")}
+        ${stat("Online", online, "#34d399")}
+        ${stat("Disabled", disabled, disabled > 0 ? "#f87171" : "#7c8aa8")}
+        ${stat("Qualified calls", qualifiedCalls, "#a5b4fc")}
+        ${stat("Leads found", leadCount, "#fbbf24")}
+        ${stat("Avg score", avgScore, "#94a3b8")}
+      </div>
+
+      <div id="section-customers">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin:0 0 10px">
+          <h2 style="font-size:15px;font-weight:700;color:#c7d2fe;margin:0">Customers</h2>
         </div>
-        <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-          <button class="btn" id="createBtn">Create customer</button>
-          <button class="btn ghost" id="cancelBtn">Cancel</button>
-          <span id="createMsg" style="font-size:13px"></span>
-        </div>
-        <div id="resultBox" style="display:none;margin-top:16px;background:#0b1220;border:1px solid #312e81;border-radius:12px;padding:16px">
-          <div style="color:#a78bfa;font-weight:650;margin-bottom:10px">Customer created — give them this key:</div>
-          <div id="resultDetails" style="font-size:12px;color:#94a3b8;line-height:1.8"></div>
-          <button class="btn" id="doneBtn" style="margin-top:14px">Done</button>
+        <div class="card" style="overflow:auto">
+          <table>
+            <thead><tr><th>Sales form</th><th>Status</th><th>Line</th><th>Call list</th><th>AI leads</th><th>Email</th><th>Last seen</th><th>Actions</th></tr></thead>
+            <tbody>${rowsTr || '<tr><td colspan="8" style="color:#7c8aa8">No customers yet - click "New customer" to add one.</td></tr>'}</tbody>
+          </table>
         </div>
       </div>
-    </div>
 
-    <h2 style="font-size:16px;font-weight:650;margin:0 0 12px;color:#c7d2fe">Customers</h2>
-    <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px">
-      ${cards || '<div class="card fade" style="padding:20px;color:#94a3b8">No customers yet. Click "New user" to add your first one.</div>'}
-    </div>
-
-    <h2 style="font-size:16px;font-weight:650;margin:26px 0 12px;color:#c7d2fe">Recent AI calls</h2>
-    <div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px">${callsHtml(calls)}</div>
-    <div id="modal" class="modal" style="position:fixed;inset:0;background:rgba(4,6,15,.92);display:none;align-items:center;justify-content:center;z-index:50;padding:24px">
-      <div class="card" style="width:720px;max-width:100%;max-height:86vh;display:flex;flex-direction:column;padding:0;overflow:hidden">
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:18px 22px;border-bottom:1px solid rgba(139,92,246,.2)">
-          <span style="font-weight:650" id="modalTitle">Transcript</span>
-          <button class="btn ghost" id="modalClose">Close</button>
+      <div id="section-calls" style="display:none;margin-top:24px">
+        <h2 style="font-size:15px;font-weight:700;color:#c7d2fe;margin:0 0 10px">AI calls</h2>
+        <div class="card" style="overflow:auto">
+          <table>
+            <thead><tr><th>Product</th><th>Result</th><th>Score</th><th>Strategies</th><th>Time</th><th></th></tr></thead>
+            <tbody>${callsTr}</tbody>
+          </table>
         </div>
-        <pre id="modalBody" style="margin:0;padding:20px 22px;overflow:auto;color:#e2e8f0;font-family:Consolas,'Courier New',monospace;font-size:12.5px;line-height:1.7;white-space:pre-wrap;flex:1"></pre>
       </div>
-    </div>
 
-    <h2 style="font-size:16px;font-weight:650;margin:26px 0 12px;color:#c7d2fe">Email outbox <span style="color:#94a3b8;font-weight:400;font-size:12px">(if no SMTP configured)</span></h2>
-    <pre style="background:#0b1220;border:1px solid #1e293b;padding:16px;border-radius:12px;color:#a5f3fc;font-size:12px;white-space:pre-wrap;overflow:auto">${outbox.length ? outbox.map(o => `— ${esc(o.file)}\n${esc(o.content)}`).join("\n\n") : "No emails out yet."}</pre>
+      <div id="section-outbox" style="display:none;margin-top:24px">
+        <h2 style="font-size:15px;font-weight:700;color:#c7d2fe;margin:0 0 10px">Email outbox <span style="color:#7c8aa8;font-weight:400;font-size:12px">(if no SMTP configured)</span></h2>
+        ${outboxHtml}
+      </div>
+    </main>
   </div>
+
+  <div id="mEdit" class="modal"></div>
+  <div id="mCallList" class="modal"></div>
+  <div id="mLeads" class="modal"></div>
+  <div id="mTranscript" class="modal"></div>
+
   <script>
+    const CUSTOMERS = ${jsonSafe(rows)};
     const $ = (id) => document.getElementById(id);
     let autoReloadTimer = null;
-    // Auto-refresh the dashboard, but NEVER while the add-user form is open
-    // (otherwise a reload would wipe what you're typing). Re-schedules after
-    // the panel closes. Panels that should NOT trigger a refresh: also the
-    // result box stays until the user clicks Done.
-    function scheduleAutoReload(ms) {
-      if (autoReloadTimer) { clearTimeout(autoReloadTimer); autoReloadTimer = null; }
-      if ($('addPanel').style.display !== 'none') return; // form open -> no auto reload
-      if ($('modal').style.display === 'flex') return;   // transcript open -> no auto reload
-      autoReloadTimer = setTimeout(() => { location.reload(); }, ms || 20000);
-    }
-    function stopAutoReload() {
-      if (autoReloadTimer) { clearTimeout(autoReloadTimer); autoReloadTimer = null; }
-    }
 
-    function openAddPanel() {
+    function stopAutoReload(){ if(autoReloadTimer){clearTimeout(autoReloadTimer);autoReloadTimer=null;} }
+    function scheduleAutoReload(ms){
       stopAutoReload();
-      $('addPanel').style.display = 'block';
-      $('resultBox').style.display = 'none';
-      $('createMsg').textContent = '';
-      $('createBtn').disabled = false;
-      $('addPanel').scrollIntoView({ behavior: 'smooth' });
+      const anyOpen = ["mEdit","mCallList","mLeads","mTranscript"].some(id => $(id).style.display !== 'none') || $('addPanel');
+      if (anyOpen) return;
+      autoReloadTimer = setTimeout(() => location.reload(), ms || 20000);
     }
-    function closeAddPanel() {
-      $('addPanel').style.display = 'none';
-      $('resultBox').style.display = 'none';
-      $('cancelBtn').style.display = '';
-      $('createMsg').textContent = '';
-      scheduleAutoReload(20000);
+    function openModal(id){ stopAutoReload(); $(id).style.display='flex'; }
+    function closeModals(){ ["mEdit","mCallList","mLeads","mTranscript"].forEach(id => $(id).style.display='none'); scheduleAutoReload(20000); }
+    function cust(token){ return CUSTOMERS.find(c => c.token === token); }
+
+    async function apiFetch(url, opts){
+      const r = await fetch(url, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}));
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || ('HTTP '+r.status));
+      return j;
     }
 
-    function formatTranscript(t) {
-      try { const arr = JSON.parse(t); if (Array.isArray(arr)) return arr.map((x) => (x.role === 'agent' ? 'AI: ' : 'LEAD: ') + x.text).join('\n'); } catch {}
-      return String(t || '');
-    }
+    // --- nav ---
+    document.querySelectorAll('.nav[data-nav]').forEach(n => n.addEventListener('click', () => {
+      document.querySelectorAll('.nav[data-nav]').forEach(x => x.classList.remove('active'));
+      n.classList.add('active');
+      ['customers','calls','outbox'].forEach(k => $('section-'+k).style.display = (k === n.dataset.nav ? 'block' : 'none'));
+    }));
 
+    // --- add customer ---
+    const addBtn = $('addUser');
+    const addPanel = document.createElement('div');
+    addPanel.id = 'addPanel';
+    addPanel.style.display = 'none';
+    addPanel.innerHTML = \`<div class="card" style="padding:22px;margin-bottom:22px">
+      <div style="font-weight:650;font-size:14px;margin-bottom:4px">New customer account</div>
+      <div style="color:#7c8aa8;font-size:12px;margin-bottom:12px">Creates an access key. The customer pastes it into their Magic Dialer setup.</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
+        <div><label class="f">Sales form - product/service</label><input id="cProduct" class="inp" placeholder="e.g. Heating oil delivery"></div>
+        <div><label class="f">Lead info (comma-separated)</label><input id="cFields" class="inp" placeholder="Name, Phone, Address"></div>
+        <div><label class="f">Qualified-lead email</label><input id="cEmail" class="inp" placeholder="owner@company.com"></div>
+        <div><label class="f">Agent persona / name</label><input id="cPersona" class="inp" placeholder="Sophie"></div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+        <button class="btn" id="createBtn">Create customer</button>
+        <button class="btn ghost" id="cancelBtn">Cancel</button>
+        <span id="createMsg" style="font-size:13px"></span>
+      </div>
+      <div id="resultBox" style="display:none;margin-top:16px;background:#0b1220;border:1px solid #2c3350;border-radius:10px;padding:16px">
+        <div style="color:#a5b4fc;font-weight:650;margin-bottom:10px">Customer created - give them this access key:</div>
+        <div id="resultDetails" class="mono" style="font-size:12px;color:#7dd3fc;line-height:1.8"></div>
+        <button class="btn" id="doneBtn" style="margin-top:14px">Done</button>
+      </div>
+    </div>\`;
+    $('section-customers').prepend(addPanel);
+    addBtn.addEventListener('click', () => { stopAutoReload(); addPanel.style.display='block'; addPanel.scrollIntoView({behavior:'smooth'}); });
+    $('cancelBtn').addEventListener('click', () => { addPanel.style.display='none'; scheduleAutoReload(20000); });
+    $('doneBtn').addEventListener('click', () => { addPanel.style.display='none'; scheduleAutoReload(20000); });
+    $('createBtn').addEventListener('click', async () => {
+      const product = $('cProduct').value.trim();
+      if (!product) { $('createMsg').textContent='Enter the sales form product.'; $('createMsg').style.color='#f87171'; return; }
+      $('createBtn').disabled = true;
+      try {
+        const body = { product, leadFields: $('cFields').value.split(',').map(s=>s.trim()).filter(Boolean), contactEmail: $('cEmail').value.trim(), persona: $('cPersona').value.trim() || 'Sophie' };
+        const j = await apiFetch('/api/register', {method:'POST', body: JSON.stringify(body)});
+        $('resultDetails').innerHTML = 'Portal URL (agent connects here):<br>' + location.origin + '<br><br>Access key (paste into agent):<br>' + j.token;
+        $('resultBox').style.display='block';
+        $('cProduct').value=''; $('cFields').value=''; $('cEmail').value=''; $('cPersona').value='';
+        $('createMsg').textContent='Created - copy the key.'; $('createMsg').style.color='#34d399';
+      } catch(e) { $('createMsg').textContent=e.message; $('createMsg').style.color='#f87171'; $('createBtn').disabled=false; }
+    });
+
+    // --- actions ---
     document.addEventListener('click', async (e) => {
-      const btn = e.target.closest('button[data-action]');
-      if (btn) {
-        btn.disabled = true;
-        const body = { token: btn.dataset.token, disabled: btn.dataset.action === 'disable' };
-        await fetch('/api/disable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-        location.reload(); return;
+      const btn = e.target.closest('button[data-action], [data-action]');
+      if (btn && btn.dataset.action) {
+        const a = btn.dataset.action, token = btn.dataset.token;
+        if (a === 'disable' || a === 'enable') {
+          btn.disabled = true;
+          await apiFetch('/api/disable', {method:'POST', body: JSON.stringify({token, disabled: a === 'disable'})});
+          location.reload(); return;
+        }
+        if (a === 'edit') { openEdit(token); return; }
+        if (a === 'calllist') { openCallList(token); return; }
+        if (a === 'leads') { openLeads(token); return; }
       }
       if (e.target.id === 'logout') { await fetch('/logout',{method:'POST'}); location.href='/'; }
-      if (e.target.id === 'addUser') { openAddPanel(); }
-      if (e.target.id === 'cancelBtn') { closeAddPanel(); }
-      if (e.target.id === 'doneBtn') { closeAddPanel(); }
-      if (e.target.id === 'modalClose' || e.target.id === 'modal') { $('modal').style.display='none'; return; }
-      if (e.target.closest('button[data-call]')) {
-        const id = e.target.closest('button[data-call]').dataset.call;
-        const r = await fetch('/api/call?id=' + id);
-        const j = await r.json();
-        if (j.call) {
-          $('modalTitle').textContent = (j.call.product || 'Call') + ' - score ' + j.call.score;
-          $('modalBody').textContent = formatTranscript(j.call.transcript);
-          $('modal').style.display = 'flex';
-        }
-        return;
+      if (e.target.id === 'exportCsv') { exportCsv(); return; }
+      const mc = e.target.closest('#mTranscript button[data-call]');
+      if (mc) {
+        const j = await apiFetch('/api/call?id=' + mc.dataset.call);
+        $('mTranscript').innerHTML = transcriptView(j.call);
+        openModal('mTranscript'); return;
       }
-      if (e.target.id === 'createBtn') {
-        const product = $('cProduct').value.trim();
-        if (!product) { $('createMsg').textContent='Please enter what they sell.'; $('createMsg').style.color='#f87171'; return; }
-        $('createBtn').disabled = true;
-        const body = {
-          product,
-          leadFields: $('cFields').value.split(',').map(s=>s.trim()).filter(Boolean),
-          contactEmail: $('cEmail').value.trim(),
-          persona: $('cPersona').value.trim() || 'High-energy, friendly assistant'
-        };
-        const r = await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-        const j = await r.json();
-        if (r.ok) {
-          const portal = location.origin;
-          $('resultDetails').innerHTML =
-            'Portal URL (agent connects here):<br><code style="color:#a5f3fc">' + portal + '</code><br><br>' +
-            'Access key (paste into agent):<br><code style="color:#a5f3fc">' + j.token + '</code><br><br>' +
-            'Machine ID:<br><code style="color:#94a3b8">' + j.machineId + '</code>';
-          $('resultBox').style.display='block';
-          $('cancelBtn').style.display='none';
-          $('cProduct').value=''; $('cFields').value=''; $('cEmail').value=''; $('cPersona').value='';
-          $('createMsg').textContent='Created ✓ — copy the key, then click Done.'; $('createMsg').style.color='#10b981';
-        } else {
-          $('createMsg').textContent=j.error||'Error'; $('createMsg').style.color='#f87171';
-          $('createBtn').disabled=false;
+      const cc = e.target.closest('#mTranscript button[data-close]');
+      if (cc) closeModals();
+      // leads add/dismiss
+      const la = e.target.closest('[data-leadaction]');
+      if (la && la.dataset.token) {
+        const token = la.dataset.token, leads = cust(token).leads_found || [];
+        const id = la.dataset.id;
+        if (la.dataset.leadaction === 'dismiss') {
+          await apiFetch('/api/customer/'+token+'/leads/remove', {method:'POST', body: JSON.stringify({id})});
+          location.reload(); return;
+        }
+        if (la.dataset.leadaction === 'call') {
+          const lead = leads.find(l => l.id === id);
+          if (!lead) return;
+          const current = cust(token).call_list || [];
+          current.push((lead.company || lead.title) + ' : (need phone) ' + lead.source);
+          await apiFetch('/api/customer/'+token+'/calllist', {method:'POST', body: JSON.stringify({numbers: current})});
+          btn.disabled = true; btn.textContent = 'added';
         }
       }
     });
+
+    function exportCsv(){
+      let csv = 'product,status,contact_email,persona,company_call_list,leads_found\n';
+      for (const c of CUSTOMERS) {
+        csv += [c.product, c.status, c.contact_email, c.persona, (c.call_list||[]).join('|'), (c.leads_found||[]).map(l=>l.company).join('|')].map(v => '"' + String(v==null?'':v).replace(/"/g,'""') + '"').join(',') + '\n';
+      }
+      const a = document.createElement('a');
+      a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+      a.download = 'magic-dialer-customers.csv';
+      a.click();
+    }
+
+    function openEdit(token){
+      const c = cust(token); if (!c) return;
+      const s = c.settings || {};
+      $('mEdit').innerHTML = \`<div class="card" style="width:640px;max-width:100%;padding:24px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div style="font-size:15px;font-weight:700">Edit sales form</div>
+          <button class="btn ghost" data-close="1" style="padding:5px 11px">Close</button>
+        </div>
+        <div style="color:#7c8aa8;font-size:12px;margin-bottom:14px">Changes are pushed to the customer's PC on its next heartbeat.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 16px">
+          <div style="grid-column:1 / -1"><label class="f">Product / service</label><input id="eProduct" class="inp" value="\${esc(c.product||'')}"></div>
+          <div style="grid-column:1 / -1"><label class="f">Lead info needed (comma-separated)</label><input id="eFields" class="inp" value="\${esc((c.lead_fields||[]).join(', '))}"></div>
+          <div><label class="f">Qualified-lead email</label><input id="eEmail" class="inp" value="\${esc(c.contact_email||'')}"></div>
+          <div><label class="f">Agent persona / name</label><input id="ePersona" class="inp" value="\${esc(c.persona||'')}"></div>
+          <div><label class="f">Company name (agent intro)</label><input id="eCompany" class="inp" value="\${esc(s.companyName||'')}"></div>
+          <div><label class="f">Service call-back number</label><input id="eCallback" class="inp" value="\${esc(s.callbackNumber||'')}"></div>
+          <div><label class="f">Calls back within (e.g. 30 minutes)</label><input id="eCallbackIn" class="inp" value="\${esc(s.callbackIn||'')}"></div>
+        </div>
+        <label style="display:flex;gap:8px;align-items:center;margin-top:14px;font-size:13px;color:#cbd5e1">
+          <input type="checkbox" id="eSearch" \${s.searchEnabled ? 'checked' : ''}> Let Magic Dialer search the internet for leads on its own
+        </label>
+        <div style="display:flex;gap:8px;margin-top:18px">
+          <button class="btn" id="eSave">Save changes</button>
+          <button class="btn ghost" data-close="1">Cancel</button>
+        </div>
+      </div>\`;
+      openModal('mEdit');
+      setTimeout(() => {
+        const sv = $.extend ? null : null;
+        const closeBtns = $('mEdit').querySelectorAll('[data-close]');
+        closeBtns.forEach(b => b.addEventListener('click', closeModals));
+        $('eSave').addEventListener('click', async () => {
+          $('eSave').disabled = true;
+          try {
+            await apiFetch('/api/customer/'+token, {method:'PATCH', body: JSON.stringify({
+              product: $('eProduct').value, leadFields: $('eFields').value.split(',').map(x=>x.trim()).filter(Boolean),
+              contactEmail: $('eEmail').value, persona: $('ePersona').value,
+              settings: { companyName: $('eCompany').value, callbackNumber: $('eCallback').value, callbackIn: $('eCallbackIn').value, searchEnabled: $('eSearch').checked }
+            })});
+            location.reload();
+          } catch(e) { alert(e.message); $('eSave').disabled = false; }
+        });
+      }, 0);
+    }
+
+    function openCallList(token){
+      const c = cust(token);
+      const list = (c.call_list || []).join('\\n');
+      $('mCallList').innerHTML = \`<div class="card" style="width:620px;max-width:100%;padding:24px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="font-size:15px;font-weight:700">Call list</div>
+          <button class="btn ghost" data-close="1" style="padding:5px 11px">Close</button>
+        </div>
+        <div style="color:#7c8aa8;font-size:12px;margin:6px 0 12px">One number per line. The AI works this list when its phone line is connected.</div>
+        <textarea id="clText" class="inp" rows="10" placeholder="+1 555 0100">\${esc(list)}</textarea>
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn" id="clSave">Save list</button>
+          <button class="btn ghost" data-close="1">Cancel</button>
+        </div>
+      </div>\`;
+      openModal('mCallList');
+      setTimeout(() => {
+        $('mCallList').querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', closeModals));
+        $('clSave').addEventListener('click', async () => {
+          $('clSave').disabled = true;
+          const numbers = $('clText').value.split(/[\\r\\n,]+/).map(s=>s.trim()).filter(Boolean);
+          await apiFetch('/api/customer/'+token+'/calllist', {method:'POST', body: JSON.stringify({numbers})});
+          location.reload();
+        });
+      }, 0);
+    }
+
+    function openLeads(token){
+      const c = cust(token);
+      const leads = c.leads_found || [];
+      const rows = leads.map(l => \`<div class="card" style="padding:14px;margin-bottom:10px">
+        <div style="font-weight:600;font-size:13.5px">\${esc(l.company||l.title)}</div>
+        <div class="mono" style="color:#7c8aa8;font-size:11.5px;margin:3px 0">\${esc(l.source||'')}</div>
+        <div style="color:#a5b4fc;font-size:12.5px;margin:4px 0">\${esc(l.snippet||'')}</div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn" data-leadaction="call" data-token="\${token}" data-id="\${esc(l.id)}" style="padding:6px 12px;font-size:12px">Add to call list</button>
+          <button class="btn ghost" data-leadaction="dismiss" data-token="\${token}" data-id="\${esc(l.id)}" style="padding:6px 12px;font-size:12px">Dismiss</button>
+        </div>
+      </div>\`).join('');
+      $('mLeads').innerHTML = \`<div class="card" style="width:680px;max-width:100%;padding:24px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="font-size:15px;font-weight:700">Internet lead finder</div>
+          <button class="btn ghost" data-close="1" style="padding:5px 11px">Close</button>
+        </div>
+        <div style="color:#7c8aa8;font-size:12px;margin:6px 0 14px">Searches the web for companies tied to "\${esc(c.product||'')}" and stores them here. Review, then push the good ones into the call list.</div>
+        <div style="margin-bottom:14px">
+          <button class="btn" id="leadSearchBtn">\${leads.length ? 'Search the internet again' : 'Search the internet for leads'}</button>
+          <span id="leadStatus" style="font-size:13px;margin-left:10px"></span>
+        </div>
+        <div id="leadRows">\${rows || '<div style="color:#7c8aa8;font-size:13px">No leads found yet.</div>'}</div>
+      </div>\`;
+      openModal('mLeads');
+      setTimeout(() => {
+        $('mLeads').querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', closeModals));
+        $('leadSearchBtn').addEventListener('click', async () => {
+          const b = $('leadSearchBtn'); b.disabled = true; $('leadStatus').textContent = 'Searching the web...';
+          try {
+            const j = await apiFetch('/api/customer/'+token+'/leads/search', {method:'POST', body: '{}'});
+            if (j.error) { $('leadStatus').textContent = j.error; $('leadStatus').style.color='#f87171'; }
+            else { $('leadStatus').textContent = j.leads.length + ' leads found.'; $('leadStatus').style.color='#34d399'; location.reload(); }
+          } catch(e) { $('leadStatus').textContent = e.message; $('leadStatus').style.color='#f87171'; }
+          b.disabled = false;
+        });
+      }, 0);
+    }
+
+    function transcriptView(call){
+      let lines = [];
+      try { const arr = JSON.parse(call.transcript); if (Array.isArray(arr)) lines = arr.map(x => (x.role==='agent'?'AI : ':'LEAD: ')+x.text); } catch {}
+      if (!lines.length) lines = String(call.transcript||'').split('\\n');
+      return \`<div class="card" style="width:720px;max-width:100%;padding:0;display:flex;flex-direction:column;max-height:86vh;overflow:hidden">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid rgba(99,102,241,.2)">
+          <span style="font-weight:650">\${esc(call.product||'Call')} - score \${call.score}</span>
+          <button class="btn ghost" data-close="1">Close</button>
+        </div>
+        <pre class="mono" style="margin:0;padding:18px 20px;overflow:auto;color:#e2e8f0;font-size:12.5px;line-height:1.7;white-space:pre-wrap;flex:1">\${esc(lines.join('\\n'))}</pre>
+      </div>\`;
+    }
+
+    // global close handlers for data-close buttons inside modals
+    document.addEventListener('click', (e) => {
+      if (e.target.closest('[data-close]')) closeModals();
+    });
+
     scheduleAutoReload(20000);
   </script>`);
 }
 
 function callsHtml(calls) {
-  if (!calls.length) return '<div class="card fade" style="padding:18px;color:#94a3b8">No calls yet.</div>';
+  if (!calls.length) return '<tr><td colspan="6" style="color:#7c8aa8">No calls yet.</td></tr>';
   return calls.map((c) => {
     const ok = c.good_lead === 1;
     let strategies = [];
-    if (c.strategies) { try { strategies = JSON.parse(c.strategies); } catch { strategies = []; } }
+    if (c.strategies) { try { strategies = JSON.parse(c.strategies); } catch {} }
     const chips = strategies.slice(0, 3).map((k) =>
-      `<span class="badge" style="background:rgba(139,92,246,.15);color:#c4b5fd;letter-spacing:.2px;text-transform:none">${esc(k.replace(/_/g, " "))}</span>`
+      `<span class="badge neutral">${esc(k.replace(/_/g, " "))}</span>`
     ).join(" ");
-    return `<div class="card fade" style="padding:16px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <span style="font-weight:600">${esc(c.product || "call")}</span>
-        <span class="${ok ? "badge online" : "badge offline"}">${ok ? "QUALIFIED" : c.escalated === 1 ? "ESCALATED" : "no lead"}</span>
-      </div>
-      <div style="font-size:12px;color:#94a3b8;line-height:1.6">Score: ${c.score} &middot; ${new Date(c.created_at).toLocaleString()}</div>
-      ${chips ? `<div style="display:flex;gap:6px;margin:10px 0 4px;flex-wrap:wrap">${chips}</div>` : ""}
-      <button class="btn ghost" data-call="${c.id}" style="margin-top:8px;padding:7px 12px;font-size:12px">View transcript</button>
-    </div>`;
+    return `<tr>
+      <td style="font-weight:600">${esc(c.product || "call")}</td>
+      <td><span class="${ok ? "badge online" : "badge offline"}">${ok ? "QUALIFIED" : c.escalated === 1 ? "ESCALATED" : "no lead"}</span></td>
+      <td>${c.score}</td>
+      <td><div style="display:flex;gap:6px;flex-wrap:wrap">${chips || '<span style="color:#7c8aa8;font-size:12px">-</span>'}</div></td>
+      <td style="color:#7c8aa8;font-size:12px;white-space:nowrap">${new Date(c.created_at).toLocaleString()}</td>
+      <td><button class="btn ghost" data-call="${c.id}" style="padding:5px 10px;font-size:12px">Transcript</button></td>
+    </tr>`;
   }).join("");
-}
-
-function safeParse(s) {
-  if (!s) return [];
-  try { const v = JSON.parse(s); return Array.isArray(v) ? v : []; } catch { return []; }
 }
 
 // Allow running directly: node server.js [port]

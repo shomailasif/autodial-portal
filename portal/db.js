@@ -52,6 +52,10 @@ async function openDb(dbPath) {
       lead_fields  TEXT,
       contact_email TEXT,
       persona      TEXT,
+      settings     TEXT,
+      call_list    TEXT,
+      leads_found  TEXT,
+      leads_searched_at INTEGER,
       created_at   INTEGER NOT NULL,
       last_seen    INTEGER,
       status       TEXT NOT NULL DEFAULT 'online',
@@ -72,8 +76,10 @@ async function openDb(dbPath) {
     );
   `);
   const cols = db.prepare("PRAGMA table_info(customers)").all();
-  if (!cols.some((c) => c.name === "voip_ready")) {
-    db.exec("ALTER TABLE customers ADD COLUMN voip_ready INTEGER NOT NULL DEFAULT 0");
+  for (const col of [["voip_ready", "INTEGER NOT NULL DEFAULT 0"], ["settings", "TEXT"], ["call_list", "TEXT"], ["leads_found", "TEXT"], ["leads_searched_at", "INTEGER"]]) {
+    if (!cols.some((c) => c.name === col[0])) {
+      db.exec(`ALTER TABLE customers ADD COLUMN ${col[0]} ${col[1]}`);
+    }
   }
   const callCols = db.prepare("PRAGMA table_info(calls)").all();
   if (!callCols.some((c) => c.name === "strategies")) {
@@ -91,6 +97,10 @@ async function initPostgres(pool) {
       lead_fields  TEXT,
       contact_email TEXT,
       persona      TEXT,
+      settings     TEXT,
+      call_list    TEXT,
+      leads_found  TEXT,
+      leads_searched_at BIGINT,
       created_at   BIGINT NOT NULL,
       last_seen    BIGINT,
       status       TEXT NOT NULL DEFAULT 'online',
@@ -110,6 +120,19 @@ async function initPostgres(pool) {
       created_at   BIGINT NOT NULL
     );
   `);
+  // Migrations for deployments that already exist (CREATE IF NOT EXISTS never
+  // adds columns): the platform features + strategies need these columns, or
+  // saveLeads/updateCustomer/call-result crashes on a pre-existing DB.
+  for (const ddl of [
+    "ALTER TABLE customers ADD COLUMN IF NOT EXISTS voip_ready INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE customers ADD COLUMN IF NOT EXISTS settings TEXT",
+    "ALTER TABLE customers ADD COLUMN IF NOT EXISTS call_list TEXT",
+    "ALTER TABLE customers ADD COLUMN IF NOT EXISTS leads_found TEXT",
+    "ALTER TABLE customers ADD COLUMN IF NOT EXISTS leads_searched_at BIGINT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS strategies TEXT",
+  ]) {
+    await pool.query(ddl).catch(() => {}); // ignore benign duplicates / lock races
+  }
 }
 
 function rowToCustomer(r) {
@@ -121,6 +144,10 @@ function rowToCustomer(r) {
     lead_fields: r.lead_fields,
     contact_email: r.contact_email,
     persona: r.persona,
+    settings: safeParseObj(r.settings),
+    call_list: safeParseArr(r.call_list),
+    leads_found: safeParseArr(r.leads_found),
+    leads_searched_at: r.leads_searched_at == null ? null : Number(r.leads_searched_at),
     created_at: Number(r.created_at),
     last_seen: r.last_seen == null ? null : Number(r.last_seen),
     status: r.status,
@@ -190,13 +217,106 @@ async function processHeartbeat(db, { token, voipReady }) {
     disabled: c.disabled === 1,
     since: new Date(c.disabled === 1 ? c.last_seen || 0 : 0).toISOString(),
     config: {
+      token,
       product: c.product,
       leadFields: safeParse(c.lead_fields),
       contactEmail: c.contact_email,
       persona: c.persona,
       voipReady: (vp ? 1 : c.voip_ready) === 1,
+      companyName: (c.settings && c.settings.companyName) || null,
+      callbackNumber: (c.settings && c.settings.callbackNumber) || null,
+      callbackIn: (c.settings && c.settings.callbackIn) || null,
+      callList: c.call_list || [],
+      searchEnabled: !!(c.settings && c.settings.searchEnabled),
     },
   };
+}
+
+/**
+ * Apply an admin edit to a customer (sales form fields + agent settings).
+ * Only provided keys are updated; null settings keys are cleared to "".
+ */
+async function updateCustomer(db, token, patch) {
+  const c = await getCustomerByToken(db, token);
+  if (!c) return null;
+  const upd = [];
+  const vals = [];
+  const push = (col, v) => { upd.push(col); vals.push(v); };
+  if (typeof patch.product === "string") push("product", patch.product || null);
+  if (Array.isArray(patch.leadFields)) push("lead_fields", JSON.stringify(patch.leadFields));
+  if (typeof patch.contactEmail === "string") push("contact_email", patch.contactEmail || null);
+  if (typeof patch.persona === "string") push("persona", patch.persona || null);
+  if (patch.settings && typeof patch.settings === "object") {
+    const merged = { ...(c.settings || {}) };
+    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled"]) {
+      if (k in patch.settings) merged[k] = patch.settings[k];
+    }
+    push("settings", JSON.stringify(merged));
+  }
+
+  if (upd.length) {
+    if (db.pool) {
+      const setSql = upd.map((col, i) => `${col} = $${i + 1}`).join(", ");
+      await db.pool.query(`UPDATE customers SET ${setSql} WHERE token = $${upd.length + 1}`, [...vals, token]);
+    } else {
+      const setSql = upd.map((col) => `${col} = ?`).join(", ");
+      db.sqlite.prepare(`UPDATE customers SET ${setSql} WHERE token = ?`).run(...vals, token);
+    }
+  }
+  return getCustomerByToken(db, token);
+}
+
+async function setCallList(db, token, list) {
+  const c = await getCustomerByToken(db, token);
+  if (!c) return null;
+  const arr = Array.isArray(list) ? list.map((n) => String(n).trim()).filter(Boolean) : [];
+  const json = JSON.stringify(arr);
+  if (db.pool) {
+    await db.pool.query("UPDATE customers SET call_list = $1 WHERE token = $2", [json, token]);
+  } else {
+    db.sqlite.prepare("UPDATE customers SET call_list = ? WHERE token = ?").run(json, token);
+  }
+  return setCallListRaw(db, token, arr);
+}
+
+/** Save the internet-found leads for a customer and stamp when we searched.
+ * Each lead gets a stable id (derived from its source) and duplicates are
+ * dropped, so remove/reseat commands always work. */
+async function saveLeads(db, token, leads) {
+  const c = await getCustomerByToken(db, token);
+  const seen = new Set();
+  const arr = [];
+  for (const raw of Array.isArray(leads) ? leads : []) {
+    const lead = raw && typeof raw === "object" ? raw : { title: String(raw) };
+    const key = String(lead.source || lead.title || "");
+    if (!key) continue;
+    lead.id = lead.id || crypto.createHash("md5").update(key).digest("hex").slice(0, 16);
+    if (seen.has(lead.id)) continue;
+    seen.add(lead.id);
+    arr.push(lead);
+  }
+  const json = JSON.stringify(arr.slice(0, 200));
+  const now = Date.now();
+  if (db.pool) {
+    await db.pool.query("UPDATE customers SET leads_found = $1, leads_searched_at = $2 WHERE token = $3", [json, now, token]);
+  } else {
+    db.sqlite.prepare("UPDATE customers SET leads_found = ?, leads_searched_at = ? WHERE token = ?").run(json, now, token);
+  }
+  if (!c) return null;
+  return getCustomerByToken(db, token);
+}
+
+async function setCallListRaw(db, token, arr) {
+  const c = await getCustomerByToken(db, token);
+  if (!c) return null;
+  const json = JSON.stringify(arr);
+  if (db.pool) {
+    await db.pool.query("UPDATE customers SET call_list = $1 WHERE token = $2", [json, token]);
+    const r = await db.pool.query("SELECT * FROM customers WHERE token = $1", [token]);
+    return rowToCustomer(r.rows[0]);
+  }
+  db.sqlite.prepare("UPDATE customers SET call_list = ? WHERE token = ?").run(json, token);
+  return rowToCustomer(db.sqlite.prepare("SELECT * FROM customers WHERE token = ?").get(token));
 }
 
 async function setDisabled(db, token, disabled) {
@@ -275,6 +395,26 @@ function safeParse(s) {
   }
 }
 
+function safeParseArr(s) {
+  if (s == null || s === "") return [];
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+function safeParseObj(s) {
+  if (s == null || s === "") return {};
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch {
+    return {};
+  }
+}
+
 module.exports = {
   openDb,
   registerCustomer,
@@ -287,5 +427,8 @@ module.exports = {
   logCall,
   allCalls,
   getCallById,
+  updateCustomer,
+  setCallList,
+  saveLeads,
   USES_PG,
 };
