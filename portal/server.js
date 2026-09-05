@@ -125,7 +125,11 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       if (!c.product) return send(200, { leads: [], searchedAt: null, error: "Set the sales form first (no product to search for)." });
       const leads = await searchLeads({ product: c.product, count: 12 });
       const saved = await saveLeads(db, c.token, leads);
-      return send(200, { leads: saved.leads_found, searchedAt: saved.leads_searched_at });
+      return send(200, {
+        leads: saved.leads_found,
+        searchedAt: saved.leads_searched_at,
+        error: leads.length ? null : "The search ran but found nothing right now - free search engines often throttle cloud IPs. Try again in a few minutes.",
+      });
     }
     if (cmLeadsRemove && method === "POST") {
       if (!isAdmin) return send(401, { error: "Admin login required" });
