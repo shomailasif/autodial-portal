@@ -22,20 +22,22 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
 
   setInterval(() => { markStaleOffline(db, STALE_AFTER_MS + 2000); }, HEARTBEAT_INTERVAL_MS);
 
-  // Optional: let the platform find leads for customers on its own.
-  if (process.env.LEAD_AUTO === "1") {
+  // Find leads for customers on its own, on a schedule. On by default so the
+  // platform works out of the box; operators can opt out with LEAD_AUTO=0.
+  {
+    const hours = Math.max(1, Math.min(24, parseFloat(process.env.LEAD_AUTO_HOURS) || 6));
     setInterval(async () => {
       try {
         const rows = await allCustomers(db);
         for (const c of rows) {
           const want = !!(c.settings && c.settings.searchEnabled);
           const old = (c.leads_searched_at || 0) < Date.now() - 1000 * 60 * 60 * 24;
-          if (!want || !old || !c.product) continue;
+          if (process.env.LEAD_AUTO === "0" || !want || !old || !c.product) continue;
           const leads = await searchLeads({ product: c.product, count: 10 });
           if (leads.length) await saveLeads(db, c.token, leads);
         }
       } catch { /* scheduler must never crash the portal */ }
-    }, 1000 * 60 * 60 * 6);
+    }, 1000 * 60 * 60 * hours);
   }
 
   async function readBody(req) {
