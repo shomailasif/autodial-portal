@@ -235,7 +235,9 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
         });
         fs.createReadStream(file).pipe(res);
       } catch {
-        return send(404, { error: "Installer not available on this instance - use the GitHub release." });
+        // The exe isn't stored on the host: send the customer to the GitHub release asset.
+        res.writeHead(302, { "Location": "https://github.com/shomailasif/magic-dialer/releases/latest/download/MagicDialer-Setup.exe", "Access-Control-Allow-Origin": "*" });
+        res.end();
       }
       return;
     }
