@@ -227,7 +227,7 @@ async function processHeartbeat(db, { token, voipReady }) {
       callbackNumber: (c.settings && c.settings.callbackNumber) || null,
       callbackIn: (c.settings && c.settings.callbackIn) || null,
       callList: c.call_list || [],
-      searchEnabled: !!(c.settings && c.settings.searchEnabled),
+      searchEnabled: !(c.settings && c.settings.searchEnabled === false),
     },
   };
 }

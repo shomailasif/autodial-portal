@@ -30,7 +30,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       try {
         const rows = await allCustomers(db);
         for (const c of rows) {
-          const want = !!(c.settings && c.settings.searchEnabled);
+          const want = !(c.settings && c.settings.searchEnabled === false);
           const old = (c.leads_searched_at || 0) < Date.now() - 1000 * 60 * 60 * 24;
           if (process.env.LEAD_AUTO === "0" || !want || !old || !c.product) continue;
           const leads = await searchLeads({ product: c.product, count: 10 });
@@ -632,7 +632,7 @@ function dashboardHtml(rows, calls = [], outbox = []) {
           <div><label class="f">Calls back within (e.g. 30 minutes)</label><input id="eCallbackIn" class="inp" value="\${esc(s.callbackIn||'')}"></div>
         </div>
         <label style="display:flex;gap:8px;align-items:center;margin-top:14px;font-size:13px;color:#cbd5e1">
-          <input type="checkbox" id="eSearch" \${s.searchEnabled ? 'checked' : ''}> Let Magic Dialer search the internet for leads on its own
+          <input type="checkbox" id="eSearch" \${s.searchEnabled !== false ? 'checked' : ''}> Let Magic Dialer search the internet for leads on its own
         </label>
         <div style="display:flex;gap:8px;margin-top:18px">
           <button class="btn" id="eSave">Save changes</button>
