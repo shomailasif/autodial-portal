@@ -266,6 +266,7 @@ async function processHeartbeat(db, { token, voipReady }) {
       callList: c.call_list || [],
       searchEnabled: !(c.settings && c.settings.searchEnabled === false),
       lang: (c.settings && /^(en|es|fr|de|pt|hi|auto)$/.test(c.settings.lang)) ? c.settings.lang : "en",
+      voiceStyle: (c.settings && /^(human|frank|friendly)$/.test(c.settings.voiceStyle)) ? c.settings.voiceStyle : "human",
     },
   };
 }
@@ -286,10 +287,11 @@ async function updateCustomer(db, token, patch) {
   if (typeof patch.persona === "string") push("persona", patch.persona || null);
   if (patch.settings && typeof patch.settings === "object") {
     const merged = { ...(c.settings || {}) };
-    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled", "lang"]) {
+    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled", "lang", "voiceStyle"]) {
       if (k in patch.settings) {
         // Reject invalid language codes so a typo never clobbers a good value.
         if (k === "lang" && !/^(en|es|fr|de|pt|hi|auto)$/.test(String(patch.settings.lang))) continue;
+        if (k === "voiceStyle" && !/^(human|frank|friendly)$/.test(String(patch.settings.voiceStyle))) continue;
         merged[k] = patch.settings[k];
       }
     }

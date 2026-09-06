@@ -647,6 +647,11 @@ function dashboardHtml(rows, calls = [], outbox = []) {
             <option value="hi">हिन्दी (Hindi)</option>
             <option value="auto">Auto-detect on first reply</option>
           </select></div>
+          <div><label class="f">Agent voice</label><select id="eVStyle" class="inp">
+            <option value="human">Human (natural)</option>
+            <option value="frank">Frank (direct/business)</option>
+            <option value="friendly">Friendly (warm/upbeat)</option>
+          </select></div>
         </div>
         <label style="display:flex;gap:8px;align-items:center;margin-top:14px;font-size:13px;color:#cbd5e1">
           <input type="checkbox" id="eSearch" \${s.searchEnabled !== false ? 'checked' : ''}> Let Magic Dialer search the internet for leads on its own
@@ -663,13 +668,15 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         closeBtns.forEach(b => b.addEventListener('click', closeModals));
         const langEl = $('eLang');
         if (langEl) langEl.value = /^(en|es|fr|de|pt|hi|auto)$/.test(s.lang || '') ? s.lang : 'en';
+        const vsEl = $('eVStyle');
+        if (vsEl) vsEl.value = /^(human|frank|friendly)$/.test(s.voiceStyle || '') ? s.voiceStyle : 'human';
         $('eSave').addEventListener('click', async () => {
           $('eSave').disabled = true;
           try {
             await apiFetch('/api/customer/'+token, {method:'PATCH', body: JSON.stringify({
               product: $('eProduct').value, leadFields: $('eFields').value.split(',').map(x=>x.trim()).filter(Boolean),
               contactEmail: $('eEmail').value, persona: $('ePersona').value,
-              settings: { companyName: $('eCompany').value, callbackNumber: $('eCallback').value, callbackIn: $('eCallbackIn').value, searchEnabled: $('eSearch').checked, lang: $('eLang').value }
+              settings: { companyName: $('eCompany').value, callbackNumber: $('eCallback').value, callbackIn: $('eCallbackIn').value, searchEnabled: $('eSearch').checked, lang: $('eLang').value, voiceStyle: $('eVStyle').value }
             })});
             location.reload();
           } catch(e) { alert(e.message); $('eSave').disabled = false; }
