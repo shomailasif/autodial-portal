@@ -1,14 +1,14 @@
-const path = require("node:path");
+﻿const path = require("node:path");
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 
 /**
- * Portal database — DUAL BACKEND.
+ * Portal database â€” DUAL BACKEND.
  *
  *  - When `DATABASE_URL` is set (e.g. a free Neon Postgres URL), the portal
  *    uses Postgres (the `pg` client). This is what you want on free PaaS
  *    hosts (Koyeb/Render) because their local disk is ephemeral and resets
- *    on restart — a cloud DB keeps customers, calls and disable state safe.
+ *    on restart â€” a cloud DB keeps customers, calls and disable state safe.
  *  - Otherwise it falls back to the local SQLite file (node:sqlite) so the
  *    portal still works fully offline / in local dev with zero setup.
  *
@@ -22,6 +22,18 @@ const crypto = require("node:crypto");
 
 const USES_PG = !!process.env.DATABASE_URL;
 
+/**
+ * Tenant identity for this portal instance.
+ *
+ * Each deployed portal runs with its own PORTAL_ID (default "main"). Every
+ * customer and call is stamped with the portal it was created on, and every
+ * read is scoped to the current portal - so even if two portals share the same
+ * database, neither can see or count the other's users.
+ */
+function portalId() {
+  return String(process.env.PORTAL_ID || "main");
+}
+
 let pgPool = null;
 async function getPool() {
   if (!USES_PG) return null;
@@ -33,10 +45,11 @@ async function getPool() {
 }
 
 async function openDb(dbPath) {
+  const sid = portalId();
   if (USES_PG) {
     const pool = await getPool();
     await initPostgres(pool);
-    return { pool };
+    return { pool, portalId: sid };
   }
   if (dbPath !== ":memory:") {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -60,7 +73,8 @@ async function openDb(dbPath) {
       last_seen    INTEGER,
       status       TEXT NOT NULL DEFAULT 'online',
       disabled     INTEGER NOT NULL DEFAULT 0,
-      voip_ready   INTEGER NOT NULL DEFAULT 0
+      voip_ready   INTEGER NOT NULL DEFAULT 0,
+      portal_id    TEXT NOT NULL DEFAULT 'main'
     );
     CREATE TABLE IF NOT EXISTS calls (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,11 +86,12 @@ async function openDb(dbPath) {
       escalated    INTEGER NOT NULL DEFAULT 0,
       strategies   TEXT,
       summary      TEXT,
-      created_at   INTEGER NOT NULL
+      created_at   INTEGER NOT NULL,
+      portal_id    TEXT NOT NULL DEFAULT 'main'
     );
   `);
   const cols = db.prepare("PRAGMA table_info(customers)").all();
-  for (const col of [["voip_ready", "INTEGER NOT NULL DEFAULT 0"], ["settings", "TEXT"], ["call_list", "TEXT"], ["leads_found", "TEXT"], ["leads_searched_at", "INTEGER"]]) {
+  for (const col of [["voip_ready", "INTEGER NOT NULL DEFAULT 0"], ["settings", "TEXT"], ["call_list", "TEXT"], ["leads_found", "TEXT"], ["leads_searched_at", "INTEGER"], ["portal_id", "TEXT NOT NULL DEFAULT 'main'"]]) {
     if (!cols.some((c) => c.name === col[0])) {
       db.exec(`ALTER TABLE customers ADD COLUMN ${col[0]} ${col[1]}`);
     }
@@ -85,7 +100,16 @@ async function openDb(dbPath) {
   if (!callCols.some((c) => c.name === "strategies")) {
     db.exec("ALTER TABLE calls ADD COLUMN strategies TEXT");
   }
-  return { sqlite: db };
+  if (!callCols.some((c) => c.name === "portal_id")) {
+    db.exec("ALTER TABLE calls ADD COLUMN portal_id TEXT NOT NULL DEFAULT 'main'");
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_customers_portal ON customers(portal_id);
+    CREATE INDEX IF NOT EXISTS idx_calls_portal ON calls(portal_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_calls_customer ON calls(customer_token);
+    CREATE INDEX IF NOT EXISTS idx_customers_machine ON customers(machine_id, portal_id);
+  `);
+  return { sqlite: db, portalId: sid };
 }
 
 async function initPostgres(pool) {
@@ -105,7 +129,8 @@ async function initPostgres(pool) {
       last_seen    BIGINT,
       status       TEXT NOT NULL DEFAULT 'online',
       disabled     INTEGER NOT NULL DEFAULT 0,
-      voip_ready   INTEGER NOT NULL DEFAULT 0
+      voip_ready   INTEGER NOT NULL DEFAULT 0,
+      portal_id    TEXT NOT NULL DEFAULT 'main'
     );
     CREATE TABLE IF NOT EXISTS calls (
       id           BIGSERIAL PRIMARY KEY,
@@ -117,7 +142,8 @@ async function initPostgres(pool) {
       escalated    INTEGER NOT NULL DEFAULT 0,
       strategies   TEXT,
       summary      TEXT,
-      created_at   BIGINT NOT NULL
+      created_at   BIGINT NOT NULL,
+      portal_id    TEXT NOT NULL DEFAULT 'main'
     );
   `);
   // Migrations for deployments that already exist (CREATE IF NOT EXISTS never
@@ -129,9 +155,19 @@ async function initPostgres(pool) {
     "ALTER TABLE customers ADD COLUMN IF NOT EXISTS call_list TEXT",
     "ALTER TABLE customers ADD COLUMN IF NOT EXISTS leads_found TEXT",
     "ALTER TABLE customers ADD COLUMN IF NOT EXISTS leads_searched_at BIGINT",
+    "ALTER TABLE customers ADD COLUMN IF NOT EXISTS portal_id TEXT NOT NULL DEFAULT 'main'",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS strategies TEXT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS portal_id TEXT NOT NULL DEFAULT 'main'",
   ]) {
     await pool.query(ddl).catch(() => {}); // ignore benign duplicates / lock races
+  }
+  for (const idx of [
+    "CREATE INDEX IF NOT EXISTS idx_customers_portal ON customers(portal_id)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_portal ON calls(portal_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_customer ON calls(customer_token)",
+    "CREATE INDEX IF NOT EXISTS idx_customers_machine ON customers(machine_id, portal_id)",
+  ]) {
+    await pool.query(idx).catch(() => {});
   }
 }
 
@@ -153,6 +189,7 @@ function rowToCustomer(r) {
     status: r.status,
     disabled: Number(r.disabled),
     voip_ready: Number(r.voip_ready),
+    portal_id: r.portal_id,
   };
 }
 
@@ -163,16 +200,16 @@ async function registerCustomer(db, { product, leadFields, contactEmail, persona
   const leadJson = JSON.stringify(leadFields || []);
   if (db.pool) {
     await db.pool.query(
-      `INSERT INTO customers (token, machine_id, product, lead_fields, contact_email, persona, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [token, machineId, product || null, leadJson, contactEmail || null, persona || "High-energy friendly helper", created],
+      `INSERT INTO customers (token, machine_id, product, lead_fields, contact_email, persona, created_at, portal_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [token, machineId, product || null, leadJson, contactEmail || null, persona || "High-energy friendly helper", created, db.portalId],
     );
     return { token, machineId, product, leadFields, contactEmail, persona: persona || "High-energy friendly helper" };
   }
   db.sqlite.prepare(
-    `INSERT INTO customers (token, machine_id, product, lead_fields, contact_email, persona, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(token, machineId, product || null, leadJson, contactEmail || null, persona || "High-energy friendly helper", created);
+    `INSERT INTO customers (token, machine_id, product, lead_fields, contact_email, persona, created_at, portal_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(token, machineId, product || null, leadJson, contactEmail || null, persona || "High-energy friendly helper", created, db.portalId);
   const row = db.sqlite.prepare("SELECT * FROM customers WHERE token = ?").get(token);
   const c = rowToCustomer(row);
   return { token, machineId: c.machine_id, product: c.product, leadFields, contactEmail: c.contact_email, persona: c.persona };
@@ -181,19 +218,19 @@ async function registerCustomer(db, { product, leadFields, contactEmail, persona
 async function findCustomerByMachine(db, machineId) {
   if (!machineId) return null;
   if (db.pool) {
-    const r = await db.pool.query("SELECT * FROM customers WHERE machine_id = $1", [machineId]);
+    const r = await db.pool.query("SELECT * FROM customers WHERE machine_id = $1 AND portal_id = $2", [machineId, db.portalId]);
     return rowToCustomer(r.rows[0]);
   }
-  return rowToCustomer(db.sqlite.prepare("SELECT * FROM customers WHERE machine_id = ?").get(machineId));
+  return rowToCustomer(db.sqlite.prepare("SELECT * FROM customers WHERE machine_id = ? AND portal_id = ?").get(machineId, db.portalId));
 }
 
 async function getCustomerByToken(db, token) {
   if (typeof token !== "string" || !token) return null;
   if (db.pool) {
-    const r = await db.pool.query("SELECT * FROM customers WHERE token = $1", [token]);
+    const r = await db.pool.query("SELECT * FROM customers WHERE token = $1 AND portal_id = $2", [token, db.portalId]);
     return rowToCustomer(r.rows[0]);
   }
-  return rowToCustomer(db.sqlite.prepare("SELECT * FROM customers WHERE token = ?").get(token));
+  return rowToCustomer(db.sqlite.prepare("SELECT * FROM customers WHERE token = ? AND portal_id = ?").get(token, db.portalId));
 }
 
 async function processHeartbeat(db, { token, voipReady }) {
@@ -228,6 +265,7 @@ async function processHeartbeat(db, { token, voipReady }) {
       callbackIn: (c.settings && c.settings.callbackIn) || null,
       callList: c.call_list || [],
       searchEnabled: !(c.settings && c.settings.searchEnabled === false),
+      lang: (c.settings && /^(en|es|fr|de|pt|hi|auto)$/.test(c.settings.lang)) ? c.settings.lang : "en",
     },
   };
 }
@@ -248,8 +286,12 @@ async function updateCustomer(db, token, patch) {
   if (typeof patch.persona === "string") push("persona", patch.persona || null);
   if (patch.settings && typeof patch.settings === "object") {
     const merged = { ...(c.settings || {}) };
-    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled"]) {
-      if (k in patch.settings) merged[k] = patch.settings[k];
+    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled", "lang"]) {
+      if (k in patch.settings) {
+        // Reject invalid language codes so a typo never clobbers a good value.
+        if (k === "lang" && !/^(en|es|fr|de|pt|hi|auto)$/.test(String(patch.settings.lang))) continue;
+        merged[k] = patch.settings[k];
+      }
     }
     push("settings", JSON.stringify(merged));
   }
@@ -335,54 +377,59 @@ async function setDisabled(db, token, disabled) {
 async function markStaleOffline(db, maxAgeMs) {
   const cutoff = Date.now() - maxAgeMs;
   if (db.pool) {
-    await db.pool.query("UPDATE customers SET status = 'offline' WHERE last_seen < $1 AND status != 'offline'", [cutoff]);
+    await db.pool.query("UPDATE customers SET status = 'offline' WHERE last_seen < $1 AND status != 'offline' AND portal_id = $2", [cutoff, db.portalId]);
   } else {
-    db.sqlite.prepare("UPDATE customers SET status = 'offline' WHERE last_seen < ? AND status != 'offline'").run(cutoff);
+    db.sqlite.prepare("UPDATE customers SET status = 'offline' WHERE last_seen < ? AND status != 'offline' AND portal_id = ?").run(cutoff, db.portalId);
   }
 }
 
 async function allCustomers(db) {
   if (db.pool) {
-    const r = await db.pool.query("SELECT * FROM customers ORDER BY created_at ASC");
+    const r = await db.pool.query("SELECT * FROM customers WHERE portal_id = $1 ORDER BY created_at ASC", [db.portalId]);
     return r.rows.map(rowToCustomer);
   }
-  return db.sqlite.prepare("SELECT * FROM customers ORDER BY created_at ASC").all().map(rowToCustomer);
+  return db.sqlite.prepare("SELECT * FROM customers WHERE portal_id = ? ORDER BY created_at ASC").all(db.portalId).map(rowToCustomer);
 }
 
 async function logCall(db, call) {
   const created = Date.now();
   const transcript = typeof call.transcript === "string" ? call.transcript : JSON.stringify(call.transcript || []);
   const strategies = call.strategies ? JSON.stringify(call.strategies) : null;
+  // Attribute the call to the portal that owns the customer, never to anyone
+  // else's portal (getCustomerByToken is portal-scoped, so a foreign token
+  // resolves to null here and the call is recorded to this instance instead).
+  const owner = call.customerToken ? await getCustomerByToken(db, call.customerToken) : null;
+  const ply = owner ? owner.portal_id : db.portalId;
   if (db.pool) {
     await db.pool.query(
-      `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, strategies, summary, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, strategies, call.summary || null, created],
+      `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, strategies, summary, created_at, portal_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, strategies, call.summary || null, created, ply],
     );
     return;
   }
   db.sqlite.prepare(
-    `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, strategies, summary, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, strategies, call.summary || null, created);
+    `INSERT INTO calls (customer_token, product, transcript, score, good_lead, escalated, strategies, summary, created_at, portal_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(call.customerToken || null, call.product || null, transcript, call.score ?? null, call.goodLead ? 1 : 0, call.escalateToHuman ? 1 : 0, strategies, call.summary || null, created, ply);
 }
 
 async function allCalls(db, limit = 20) {
   if (db.pool) {
-    const r = await db.pool.query("SELECT * FROM calls ORDER BY created_at DESC LIMIT $1", [limit || 20]);
+    const r = await db.pool.query("SELECT * FROM calls WHERE portal_id = $1 ORDER BY created_at DESC LIMIT $2", [db.portalId, limit || 20]);
     return r.rows;
   }
-  return db.sqlite.prepare("SELECT * FROM calls ORDER BY created_at DESC LIMIT ?").all(limit || 20);
+  return db.sqlite.prepare("SELECT * FROM calls WHERE portal_id = ? ORDER BY created_at DESC LIMIT ?").all(db.portalId, limit || 20);
 }
 
 async function getCallById(db, id) {
   const n = Number(id);
   if (!Number.isFinite(n)) return null;
   if (db.pool) {
-    const r = await db.pool.query("SELECT * FROM calls WHERE id = $1", [n]);
+    const r = await db.pool.query("SELECT * FROM calls WHERE id = $1 AND portal_id = $2", [n, db.portalId]);
     return r.rows[0] || null;
   }
-  return db.sqlite.prepare("SELECT * FROM calls WHERE id = ?").get(n) || null;
+  return db.sqlite.prepare("SELECT * FROM calls WHERE id = ? AND portal_id = ?").get(n, db.portalId) || null;
 }
 
 function safeParse(s) {
@@ -417,6 +464,7 @@ function safeParseObj(s) {
 
 module.exports = {
   openDb,
+  portalId,
   registerCustomer,
   findCustomerByMachine,
   getCustomerByToken,

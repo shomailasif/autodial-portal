@@ -7,6 +7,11 @@ const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword } = require("./auth");
 const { searchLeads } = require("./find-leads");
 
+// Optional tenant identity for a deployed portal (set PORTAL_NAME to brand the
+// console). Every portal already has its own PORTAL_ID and admin password; this
+// only changes the visible name. Never contains customer data.
+const tenantName = (process.env.PORTAL_NAME || "").trim();
+
 /**
  * Magic Dialer - admin cloud platform.
  *
@@ -95,7 +100,8 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
 
     if (cmToken && method === "GET") {
       if (!isAdmin) return send(401, { error: "Admin login required" });
-      return send(200, { customer: await getCustomerByToken(db, cmToken.token) });
+      const c = await getCustomerByToken(db, cmToken.token);
+      return c ? send(200, { customer: c }) : send(404, { error: "Customer not found" });
     }
     if (cmToken && method === "PATCH") {
       if (!isAdmin) return send(401, { error: "Admin login required" });
@@ -336,6 +342,7 @@ function loginHtml() {
             <div>
               <div style="font-size:20px;font-weight:700;background:linear-gradient(90deg,#a5b4fc,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent">Magic Dialer</div>
               <div style="color:#7c8aa8;font-size:13px">Platform Console</div>
+              ${tenantName ? `<div style="color:#94a3b8;font-size:12px;font-weight:600;margin-top:2px">${esc(tenantName)}</div>` : ""}
             </div>
           </div>
           <form id="f">
@@ -417,6 +424,7 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         <div>
           <div style="font-weight:700;font-size:15px">Magic Dialer</div>
           <div style="color:#7c8aa8;font-size:11px">Platform Console</div>
+          ${tenantName ? `<div style="color:#94a3b8;font-size:11px;font-weight:600;margin-top:2px">${esc(tenantName)}</div>` : ""}
         </div>
       </div>
       <div style="margin-top:16px;display:flex;flex-direction:column;gap:3px">
@@ -630,6 +638,15 @@ function dashboardHtml(rows, calls = [], outbox = []) {
           <div><label class="f">Company name (agent intro)</label><input id="eCompany" class="inp" value="\${esc(s.companyName||'')}"></div>
           <div><label class="f">Service call-back number</label><input id="eCallback" class="inp" value="\${esc(s.callbackNumber||'')}"></div>
           <div><label class="f">Calls back within (e.g. 30 minutes)</label><input id="eCallbackIn" class="inp" value="\${esc(s.callbackIn||'')}"></div>
+          <div><label class="f">Agent language</label><select id="eLang" class="inp">
+            <option value="en">English</option>
+            <option value="es">Español (Spanish)</option>
+            <option value="fr">Français (French)</option>
+            <option value="de">Deutsch (German)</option>
+            <option value="pt">Português (Portuguese)</option>
+            <option value="hi">हिन्दी (Hindi)</option>
+            <option value="auto">Auto-detect on first reply</option>
+          </select></div>
         </div>
         <label style="display:flex;gap:8px;align-items:center;margin-top:14px;font-size:13px;color:#cbd5e1">
           <input type="checkbox" id="eSearch" \${s.searchEnabled !== false ? 'checked' : ''}> Let Magic Dialer search the internet for leads on its own
@@ -644,13 +661,15 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         const sv = $.extend ? null : null;
         const closeBtns = $('mEdit').querySelectorAll('[data-close]');
         closeBtns.forEach(b => b.addEventListener('click', closeModals));
+        const langEl = $('eLang');
+        if (langEl) langEl.value = /^(en|es|fr|de|pt|hi|auto)$/.test(s.lang || '') ? s.lang : 'en';
         $('eSave').addEventListener('click', async () => {
           $('eSave').disabled = true;
           try {
             await apiFetch('/api/customer/'+token, {method:'PATCH', body: JSON.stringify({
               product: $('eProduct').value, leadFields: $('eFields').value.split(',').map(x=>x.trim()).filter(Boolean),
               contactEmail: $('eEmail').value, persona: $('ePersona').value,
-              settings: { companyName: $('eCompany').value, callbackNumber: $('eCallback').value, callbackIn: $('eCallbackIn').value, searchEnabled: $('eSearch').checked }
+              settings: { companyName: $('eCompany').value, callbackNumber: $('eCallback').value, callbackIn: $('eCallbackIn').value, searchEnabled: $('eSearch').checked, lang: $('eLang').value }
             })});
             location.reload();
           } catch(e) { alert(e.message); $('eSave').disabled = false; }

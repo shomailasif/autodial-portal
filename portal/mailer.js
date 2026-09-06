@@ -42,8 +42,13 @@ async function sendEmail({ to, subject, text }) {
   return writeOutbox({ to, subject, text, note: "No SMTP configured — recorded to outbox." });
 }
 
+function outboxDir() {
+  const pid = String(process.env.PORTAL_ID || "main").replace(/[^a-zA-Z0-9._-]/g, "");
+  return process.env.AUTODIAL_OUTBOX || path.join(`outbox-${pid}`);
+}
+
 function writeOutbox({ to, subject, text, note }) {
-  const dir = process.env.AUTODIAL_OUTBOX || path.join("outbox");
+  const dir = outboxDir();
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `lead-${Date.now()}.txt`);
   fs.writeFileSync(file, `TO: ${to}\nSUBJECT: ${subject}\nNOTE: ${note}\n\n${text}\n`, "utf8");
@@ -51,7 +56,7 @@ function writeOutbox({ to, subject, text, note }) {
 }
 
 function listOutbox() {
-  const dir = process.env.AUTODIAL_OUTBOX || path.join("outbox");
+  const dir = outboxDir();
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).map((f) => ({ file: f, content: fs.readFileSync(path.join(dir, f), "utf8") }));
 }
