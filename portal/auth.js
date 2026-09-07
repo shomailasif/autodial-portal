@@ -34,6 +34,51 @@ function issueSession(maxAgeMs = 1000 * 60 * 60 * 24) {
   return `${payload}.${sign(payload)}`;
 }
 
+/**
+ * Mint a CUSTOMER session (self-service login by access token). The token is
+ * HMAC-signed into the cookie, so a forged cookie is rejected and the server
+ * needs no session store.
+ */
+function issueCustomerSession(token, maxAgeMs = 1000 * 60 * 60 * 24) {
+  const expires = Date.now() + maxAgeMs;
+  const enc = Buffer.from(String(token)).toString("base64url");
+  const payload = `cus.${enc}.${expires}`;
+  return `${payload}.${sign(payload)}`;
+}
+
+/**
+ * Verify a customer session cookie. Returns the customer's access token, or
+ * null when the cookie is missing / forged / expired.
+ */
+function verifyCustomerSession(cookie) {
+  if (!cookie) return null;
+  const parts = String(cookie).split(".");
+  if (parts.length !== 4 || parts[0] !== "cus") return null;
+  const enc = parts[1];
+  const expires = parts[2];
+  const payload = `cus.${enc}.${expires}`;
+  const expected = sign(payload);
+  const a = Buffer.from(parts[3]);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return null;
+  // eslint-disable-next-line no-unused-vars
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  if (diff !== 0) return null;
+  if (Date.now() >= Number(expires)) return null;
+  try { return Buffer.from(enc, "base64url").toString("utf8"); } catch { return null; }
+}
+
+/** Pull the customer session value out of a Cookie request header. */
+function customerSessionFromCookieHeader(header) {
+  if (!header) return null;
+  for (const part of String(header).split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === "csession") return rest.join("=");
+  }
+  return null;
+}
+
 /** Verify a session cookie value. True only if valid + not expired. */
 function verifySession(cookie) {
   if (!cookie) return false;
@@ -74,4 +119,4 @@ function checkPassword(attempt, override) {
   return diff === 0;
 }
 
-module.exports = { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword };
+module.exports = { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader };

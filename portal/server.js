@@ -4,7 +4,7 @@ const path = require("node:path");
 const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById, updateCustomer, setCallList, saveLeads } = require("./db");
 const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("../shared/protocol");
 const { sendEmail, listOutbox } = require("./mailer");
-const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword } = require("./auth");
+const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader } = require("./auth");
 const { searchLeads } = require("./find-leads");
 
 // Optional tenant identity for a deployed portal (set PORTAL_NAME to brand the
@@ -70,6 +70,8 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
     };
 
     const isAdmin = verifySession(sessionFromCookieHeader(req.headers.cookie));
+    const myToken = verifyCustomerSession(customerSessionFromCookieHeader(req.headers.cookie));
+    const canTouch = (token) => isAdmin || (!!myToken && myToken === token);
 
     // --- Admin login page + handler ---
     if (url.pathname === "/login" && method === "GET") return send(200, loginHtml());
@@ -82,6 +84,29 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
     }
     if (url.pathname === "/logout" && method === "POST") {
       return send(200, { ok: true }, { "Set-Cookie": "session=; Path=/; HttpOnly; Max-Age=0" });
+    }
+
+    // --- Customer self-service login (users log in with their access token) ---
+    if (url.pathname === "/clogin" && method === "POST") {
+      const body = await readBody(req);
+      const c = await getCustomerByToken(db, String(body.token || "").trim());
+      if (!c) return send(404, { error: "Unknown access token" });
+      return send(200, { ok: true, name: c.persona }, { "Set-Cookie": `csession=${issueCustomerSession(c.token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400` });
+    }
+    if (url.pathname === "/clogout" && method === "POST") {
+      return send(200, { ok: true }, { "Set-Cookie": "csession=; Path=/; HttpOnly; Max-Age=0" });
+    }
+    // Customer dashboard (HTML) + JSON view of their own record.
+    if (url.pathname === "/my" && method === "GET") {
+      if (!myToken) return send(401, "Session expired - log back in with your access token.");
+      const c = await getCustomerByToken(db, myToken);
+      if (!c) return send(404, "Customer not found.");
+      return send(200, customerHomeHtml(c));
+    }
+    if (url.pathname === "/api/my" && method === "GET") {
+      if (!myToken) return send(401, { error: "Session required" });
+      const c = await getCustomerByToken(db, myToken);
+      return c ? send(200, { customer: c }) : send(404, { error: "Customer not found" });
     }
 
     // --- Heartbeat from a customer's PC (no login - the agent must work) ---
@@ -104,19 +129,18 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       return c ? send(200, { customer: c }) : send(404, { error: "Customer not found" });
     }
     if (cmToken && method === "PATCH") {
-      if (!isAdmin) return send(401, { error: "Admin login required" });
+      if (!canTouch(cmToken.token)) return send(401, { error: "Access token login required" });
+      if (!isAdmin && myToken !== cmToken.token) return send(403, { error: "You can only edit your own profile" });
       const body = await readBody(req);
-      const c = await updateCustomer(db, cmToken.token, {
-        product: body.product,
-        leadFields: Array.isArray(body.leadFields) ? body.leadFields : undefined,
-        contactEmail: body.contactEmail,
-        persona: body.persona,
-        settings: body.settings,
-      });
+      const patch = isAdmin
+        ? { product: body.product, leadFields: Array.isArray(body.leadFields) ? body.leadFields : undefined, contactEmail: body.contactEmail, persona: body.persona, settings: body.settings }
+        : { product: body.product, persona: body.persona, settings: body.settings };
+      const c = await updateCustomer(db, cmToken.token, patch);
       return c ? send(200, { ok: true, customer: c }) : send(404, { error: "Customer not found" });
     }
     if (cmCallList && method === "POST") {
-      if (!isAdmin) return send(401, { error: "Admin login required" });
+      if (!canTouch(cmCallList.token)) return send(401, { error: "Access token login required" });
+      if (!isAdmin && myToken !== cmCallList.token) return send(403, { error: "You can only edit your own call list" });
       const body = await readBody(req);
       const c = await setCallList(db, cmCallList.token, body.numbers);
       return c ? send(200, { ok: true, callList: c.call_list }) : send(404, { error: "Customer not found" });
@@ -333,25 +357,26 @@ function pageShell(title, body, { bodyClass = "" } = {}) {
 function loginHtml() {
   return pageShell("Magic Dialer - Platform Console", `
   <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">
-    <div style="max-width:1120px;width:100%;display:grid;grid-template-columns:1fr 400px;gap:48px;align-items:center">
-      <div style="display:none"></div>
-      <div>
-        <div class="card fade" style="padding:38px">
-          <div style="display:flex;align-items:center;gap:14px;margin-bottom:26px">
-            ${logoHtml(52)}
-            <div>
-              <div style="font-size:20px;font-weight:700;background:linear-gradient(90deg,#a5b4fc,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent">Magic Dialer</div>
-              <div style="color:#7c8aa8;font-size:13px">Platform Console</div>
-              ${tenantName ? `<div style="color:#94a3b8;font-size:12px;font-weight:600;margin-top:2px">${esc(tenantName)}</div>` : ""}
-            </div>
-          </div>
-          <form id="f">
-            <label class="f" for="p" style="margin-top:0">Admin password</label>
-            <input type="password" id="p" class="inp" placeholder="Your console password" autocomplete="current-password" autofocus>
-            <button class="btn" type="submit" style="width:100%;margin-top:16px;padding:12px">Sign in to console</button>
-            <div class="err" id="err" style="display:none;color:#f87171;font-size:13px;margin-top:12px;text-align:center">Wrong password. Try again.</div>
-          </form>
-        </div>
+    <div style="max-width:960px;width:100%;display:grid;grid-template-columns:1fr 1fr;gap:32px;align-items:stretch">
+      <div class="card fade" style="padding:38px">
+        <div style="font-size:20px;font-weight:700;background:linear-gradient(90deg,#a5b4fc,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:4px">Magic Dialer</div>
+        <div style="color:#7c8aa8;font-size:13px;margin-bottom:24px">Platform Console ${tenantName ? `&middot; ${esc(tenantName)}` : ""}</div>
+        <form id="f">
+          <label class="f" for="p" style="margin-top:0">Admin password</label>
+          <input type="password" id="p" class="inp" placeholder="Your console password" autocomplete="current-password" autofocus>
+          <button class="btn" type="submit" style="width:100%;margin-top:16px;padding:12px">Sign in to console</button>
+          <div class="err" id="err" style="display:none;color:#f87171;font-size:13px;margin-top:12px;text-align:center">Wrong password. Try again.</div>
+        </form>
+      </div>
+      <div class="card fade" style="padding:38px;background:rgba(12,17,30,.6)">
+        <div style="font-size:18px;font-weight:700;color:#e2e8f0;margin-bottom:4px">User access</div>
+        <div style="color:#7c8aa8;font-size:13px;margin-bottom:24px">For customers running Magic Dialer on their own PC. Sign in with your access token to manage your agent name, product, call numbers and VOIP line.</div>
+        <form id="cf">
+          <label class="f" for="ct" style="margin-top:0">Your access token</label>
+          <input type="text" id="ct" class="inp" placeholder="Paste your access token" autocapitalize="off" autocomplete="off">
+          <button class="btn" type="submit" style="width:100%;margin-top:16px;padding:12px">Open my dashboard</button>
+          <div class="err" id="cerr" style="display:none;color:#f87171;font-size:13px;margin-top:12px;text-align:center">Unknown access token.</div>
+        </form>
       </div>
     </div>
   </div>
@@ -360,6 +385,84 @@ function loginHtml() {
       e.preventDefault();
       const r = await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('p').value})});
       if (r.ok) location.href='/'; else document.getElementById('err').style.display='block';
+    });
+    document.getElementById('cf').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const r = await fetch('/clogin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('ct').value})});
+      if (r.ok) location.href='/my'; else document.getElementById('cerr').style.display='block';
+    });
+  </script>`);
+}
+
+function customerHomeHtml(c) {
+  const cfg = c.settings || {};
+  const credentials = cfg.credentials || {};
+  const voip = cfg.voip || {};
+  const list = (c.call_list || []).join("\n");
+  const state = c.disabled === 1 ? '<span class="badge disabled">DISABLED</span>' : c.status === "online" ? '<span class="badge online">ONLINE</span>' : '<span class="badge offline">OFFLINE</span>';
+  const fullName = [credentials.firstName, credentials.lastName].filter(Boolean).join(" ") || c.persona || c.product;
+  const voipReady = (voip && voip.provider === "ringcentral" && voip.number && voip.username && voip.sipPassword) ? '<span class="badge voip">RingCentral VOIP</span>' : '<span class="badge neutral">no VOIP line</span>';
+  return pageShell("My Dashboard - Magic Dialer", `
+  <div style="max-width:820px;margin:0 auto;padding:28px 20px 60px">
+    <div style="display:flex;align-items:center;gap:14px;margin-bottom:26px">
+      ${logoHtml(44)}
+      <div style="flex:1">
+        <div style="font-size:19px;font-weight:700;color:#e2e8f0">My Magic Dialer</div>
+        <div style="color:#7c8aa8;font-size:13px">Welcome, ${esc(fullName || "friend")} ${state}</div>
+      </div>
+      <button class="btn ghost" onclick="fetch('/clogout',{method:'POST'}).then(()=>location.href='/login')" style="padding:6px 12px;font-size:12px">Sign out</button>
+    </div>
+
+    <div class="card" style="padding:26px;margin-bottom:18px">
+      <div style="font-size:14px;font-weight:700;color:#e2e8f0;margin-bottom:16px">My agent</div>
+      <label class="f" for="cProduct">What I sell / service</label>
+      <input id="cProduct" class="inp" value="${esc(c.product || "")}" placeholder="e.g. Dispatch services for truckers">
+      <label class="f" for="cName" style="margin-top:14px">My name (agent says this)</label>
+      <input id="cName" class="inp" value="${esc(c.persona || "")}" placeholder="e.g. Shomail">
+      <div style="color:#7c8aa8;font-size:12px;margin-top:10px">Last online: ${c.last_seen ? esc(new Date(c.last_seen).toLocaleString()) : "never"} &middot; ${(c.leads_found || []).length} leads found</div>
+    </div>
+
+    <div class="card" style="padding:26px;margin-bottom:18px">
+      <div style="font-size:14px;font-weight:700;color:#e2e8f0;margin-bottom:6px">Numbers to call</div>
+      <div style="color:#7c8aa8;font-size:12px;margin-bottom:12px">One number per line. These are the people your agent will dial for its next call.</div>
+      <textarea id="cNumbers" class="inp" rows="5" style="resize:vertical" placeholder="+15551234567">${esc(list)}</textarea>
+    </div>
+
+    <div class="card" style="padding:26px;margin-bottom:18px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <div style="font-size:14px;font-weight:700;color:#e2e8f0">RingCentral VOIP line</div> ${voipReady}
+      </div>
+      <div style="color:#7c8aa8;font-size:12px;margin-bottom:14px">Private to this PC only - no one else can see it. When enabled, outbound calls go out over your RingCentral number instead of the PC speaker.</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div><label class="f" for="vNumber">Your RingCentral phone number</label><input id="vNumber" class="inp" value="${esc(voip.number || "")}" placeholder="+12025550100"></div>
+        <div><label class="f" for="vExt">Extension (optional)</label><input id="vExt" class="inp" value="${esc(voip.extension || "")}" placeholder="101"></div>
+        <div><label class="f" for="vUser">SIP / Direct-IP username</label><input id="vUser" class="inp" value="${esc(voip.username || "")}" placeholder="App Username"></div>
+        <div><label class="f" for="vPass">SIP / Direct-IP password</label><input id="vPass" type="password" class="inp" value="${esc(voip.sipPassword || "")}" placeholder="App Password"></div>
+      </div>
+      <div style="color:#6b7a99;font-size:11.5px;margin-top:12px;line-height:1.5">Enabled in RingCentral Admin &rarr; your user &rarr; Direct IP (SIP) &rarr; generate App Username / App Password. Credentials are stored per-user, never shared.</div>
+    </div>
+
+    <button class="btn" id="saveBtn" style="width:100%;padding:14px">Save settings</button>
+    <div class="err" id="msg" style="display:block;color:#a7f3d0;font-size:13px;margin-top:12px;text-align:center"></div>
+  </div>
+  <script>
+    document.getElementById('saveBtn').addEventListener('click', async () => {
+      const msg = document.getElementById('msg');
+      msg.style.color = '#a7f3d0'; msg.textContent = 'Saving...';
+      const token = ${jsonSafe(c.token)};
+      const voipPatch = {
+        provider: 'ringcentral',
+        number: document.getElementById('vNumber').value.trim(),
+        extension: document.getElementById('vExt').value.trim(),
+        username: document.getElementById('vUser').value.trim(),
+        sipPassword: document.getElementById('vPass').value
+      };
+      const r1 = await fetch('/api/customer/'+token, {method:'PATCH', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ product: document.getElementById('cProduct').value, persona: document.getElementById('cName').value, settings: { voip: voipPatch } })});
+      const nums = document.getElementById('cNumbers').value.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
+      const r2 = await fetch('/api/customer/'+token+'/calllist', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ numbers: nums })});
+      if (r1.ok && r2.ok) { msg.textContent = 'Saved - your agent picks this up on its next heartbeat.'; location.reload(); }
+      else { msg.style.color = '#f87171'; msg.textContent = 'Save failed - session expired?'; }
     });
   </script>`);
 }

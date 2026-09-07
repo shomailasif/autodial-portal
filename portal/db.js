@@ -240,7 +240,9 @@ async function processHeartbeat(db, { token, voipReady }) {
   const c = await getCustomerByToken(db, token);
   if (!c) return { ok: false, disabled: true, reason: "unknown" };
   const now = Date.now();
-  const vp = voipReady ? 1 : 0;
+  const s = c.settings || {};
+  const haveVoip = s.voip && s.voip.provider === "ringcentral" && s.voip.number && s.voip.username && s.voip.sipPassword;
+  const vp = (voipReady === true || !!haveVoip) ? 1 : 0;
   if (db.pool) {
     await db.pool.query(
       "UPDATE customers SET last_seen = $1, status = 'online', voip_ready = $2 WHERE token = $3",
@@ -260,6 +262,7 @@ async function processHeartbeat(db, { token, voipReady }) {
       contactEmail: c.contact_email,
       persona: c.persona,
       voipReady: (vp ? 1 : c.voip_ready) === 1,
+      voip: s.voip && s.voip.number && s.voip.username ? s.voip : null,
       companyName: (c.settings && c.settings.companyName) || null,
       callbackNumber: (c.settings && c.settings.callbackNumber) || null,
       callbackIn: (c.settings && c.settings.callbackIn) || null,
@@ -287,7 +290,7 @@ async function updateCustomer(db, token, patch) {
   if (typeof patch.persona === "string") push("persona", patch.persona || null);
   if (patch.settings && typeof patch.settings === "object") {
     const merged = { ...(c.settings || {}) };
-    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled", "lang", "voiceStyle"]) {
+    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled", "lang", "voiceStyle", "voip"]) {
       if (k in patch.settings) {
         // Reject invalid language codes so a typo never clobbers a good value.
         if (k === "lang" && !/^(en|es|fr|de|pt|hi|auto)$/.test(String(patch.settings.lang))) continue;
@@ -296,6 +299,9 @@ async function updateCustomer(db, token, patch) {
       }
     }
     push("settings", JSON.stringify(merged));
+    const v = merged.voip || {};
+    const voipReady = v && v.provider === "ringcentral" && v.number && v.username && v.sipPassword ? 1 : 0;
+    push("voip_ready", voipReady);
   }
 
   if (upd.length) {
