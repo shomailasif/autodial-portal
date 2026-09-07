@@ -507,6 +507,11 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         ${c.disabled === 1
           ? `<button class="btn ghost" style="padding:5px 10px;font-size:12px;margin-left:4px;color:#34d399" data-token="${c.token}" data-action="enable">Enable</button>`
           : `<button class="btn ghost danger" style="padding:5px 10px;font-size:12px;margin-left:4px" data-token="${c.token}" data-action="disable">Disable</button>`}
+        <div style="margin-top:8px;display:flex;gap:6px">
+          <button class="btn ghost" title="Rename the agent (persona)" style="padding:4px 9px;font-size:11.5px;color:#a5b4fc" data-token="${c.token}" data-action="qname">Rename</button>
+          <button class="btn ghost" title="Numbers this agent should call" style="padding:4px 9px;font-size:11.5px;color:#a5b4fc" data-token="${c.token}" data-action="qnums">Numbers</button>
+          <button class="btn ghost" title="Connect this user's RingCentral line" style="padding:4px 9px;font-size:11.5px;color:${c.voip_ready === 1 ? "#34d399" : "#6b7a99"}" data-token="${c.token}" data-action="qvoip">VOIP ${c.voip_ready === 1 ? "ON" : ""}</button>
+        </div>
       </td>
     </tr>`;
   }).join("");
@@ -682,6 +687,32 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         if (a === 'edit') { openEdit(token); return; }
         if (a === 'calllist') { openCallList(token); return; }
         if (a === 'leads') { openLeads(token); return; }
+        if (a === 'qname') {
+          const v = prompt('New agent name (persona):', cust(token).persona || '');
+          if (v == null || !v.trim()) return;
+          await apiFetch('/api/customer/'+token, {method:'PATCH', body: JSON.stringify({persona: v.trim()})});
+          location.reload(); return;
+        }
+        if (a === 'qnums') {
+          const v = prompt('Numbers to call (one per line):', (cust(token).call_list || []).join('\n'));
+          if (v == null) return;
+          await apiFetch('/api/customer/'+token+'/calllist', {method:'POST', body: JSON.stringify({numbers: v.split(/\r?\n/).map(s=>s.trim()).filter(Boolean)})});
+          location.reload(); return;
+        }
+        if (a === 'qvoip') {
+          const cur = (cust(token).settings || {}).voip || {};
+          const num = prompt('RingCentral phone number:', cur.number || '');
+          if (num == null) return;
+          const username = prompt('SIP / Direct-IP app username:', cur.username || '');
+          if (username == null) return;
+          const sipPassword = prompt('SIP / Direct-IP app password:', cur.sipPassword || '');
+          if (sipPassword == null) return;
+          const extension = prompt('Extension (optional, blank to skip):', cur.extension || '');
+          if (extension == null) return;
+          const voip = { provider: 'ringcentral', number: num.trim(), username: username.trim(), sipPassword, extension: extension.trim() };
+          await apiFetch('/api/customer/'+token, {method:'PATCH', body: JSON.stringify({settings: {voip}})});
+          location.reload(); return;
+        }
       }
       if (e.target.id === 'logout') { await fetch('/logout',{method:'POST'}); location.href='/'; }
       if (e.target.id === 'exportCsv') { exportCsv(); return; }
