@@ -6,6 +6,7 @@ const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("..
 const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader } = require("./auth");
 const { searchLeads } = require("./find-leads");
+const trunk = require("./trunk");
 
 // Optional tenant identity for a deployed portal (set PORTAL_NAME to brand the
 // console). Every portal already has its own PORTAL_ID and admin password; this
@@ -24,6 +25,7 @@ const tenantName = (process.env.PORTAL_NAME || "").trim();
 
 async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, adminPassword } = {}) {
   const db = await openDb(dbPath);
+  const gatewayCtx = { portalId: db.portalId, env: process.env };
 
   setInterval(() => { markStaleOffline(db, STALE_AFTER_MS + 2000); }, HEARTBEAT_INTERVAL_MS);
 
@@ -180,6 +182,43 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const c = await setDisabled(db, body.token, body.disabled ? 1 : 0);
       if (!c) return send(404, { error: "Customer not found" });
       return send(200, { ok: true, disabled: c.disabled === 1, token: c.token });
+    }
+
+    // --- Cloud call gateway: dialer control plane ---
+    // All outbound calls are placed FROM THE CLOUD over 443 (no customer PC
+    // ever needs SIP ports). The customer drops a number on their line.
+    const mDialHang = match(url.pathname, /^\/api\/dial\/([^/]+)\/hangup$/);
+    const mDialGet = match(url.pathname, /^\/api\/dial\/([^/]+)$/);
+    if (url.pathname === "/api/dial" && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const body = await readBody(req);
+      const token = (myToken && !isAdmin) ? myToken : (body.token || myToken);
+      if (!token) return send(400, { error: "Missing access token" });
+      if (!isAdmin && token !== myToken) return send(403, { error: "You can only dial on your own line" });
+      const c = await getCustomerByToken(db, token);
+      if (!c) return send(404, { error: "Customer not found" });
+      try {
+        const s = await trunk.placeCall(gatewayCtx, { customer: c, destination: body.number });
+        return send(200, { ok: true, id: s.id, status: s.status, provider: s.provider, providerLabel: s.providerLabel, destination: s.destination, error: s.error || null });
+      } catch (e) {
+        const code = e.code === "BAD_NUMBER" || e.code === "NO_DIALER" ? 400 : 500;
+        return send(code, { error: e.message });
+      }
+    }
+    if (mDialGet && method === "GET") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const s = trunk.getSession(gatewayCtx.portalId, mDialGet.token);
+      if (!s) return send(404, { error: "No such call" });
+      if (!isAdmin && s.token !== myToken) return send(403, { error: "Not your call" });
+      return send(200, { id: s.id, status: s.status, provider: s.provider, providerLabel: s.providerLabel, destination: s.destination, startedAt: s.startedAt, error: s.error || null });
+    }
+    if (mDialHang && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const s = trunk.getSession(gatewayCtx.portalId, mDialHang.token);
+      if (!s) return send(404, { error: "No such call" });
+      if (!isAdmin && s.token !== myToken) return send(403, { error: "Not your call" });
+      const done = trunk.hangUp(gatewayCtx.portalId, mDialHang.token);
+      return send(200, { ok: true, status: done.status });
     }
 
     // --- Register a customer (ADMIN ONLY) ---
@@ -394,6 +433,31 @@ function loginHtml() {
   </script>`);
 }
 
+const HOSTED_VOIP_SERVERS = {
+  ringcentral: "sip.ringcentral.com",
+  twilio: "edge.sip.twilio.com",
+  vonage: "sip.contact.vonage.com",
+  plivo: "sip.plivo.com",
+  thinq: "sip.thinq.com",
+  flowroute: "sip.flowroute.com",
+  myexotel: "sip.exotel.com",
+};
+
+function voipComplete(v) {
+  if (!v || !v.username || !v.sipPassword) return false;
+  if (v.server) return true;
+  return !!HOSTED_VOIP_SERVERS[v.provider];
+}
+
+function voipProviderLabel(p) {
+  const m = {
+    ringcentral: "RingCentral", twilio: "Twilio", vonage: "Vonage", plivo: "Plivo",
+    thinq: "ThinQ", flowroute: "Flowroute", myexotel: "MyExotel",
+    asterisk: "Asterisk", freepbx: "FreePBX", generic: "Generic SIP",
+  };
+  return m[p] || p;
+}
+
 function customerHomeHtml(c) {
   const cfg = c.settings || {};
   const credentials = cfg.credentials || {};
@@ -401,7 +465,10 @@ function customerHomeHtml(c) {
   const list = (c.call_list || []).join("\n");
   const state = c.disabled === 1 ? '<span class="badge disabled">DISABLED</span>' : c.status === "online" ? '<span class="badge online">ONLINE</span>' : '<span class="badge offline">OFFLINE</span>';
   const fullName = [credentials.firstName, credentials.lastName].filter(Boolean).join(" ") || c.persona || c.product;
-  const voipReady = (voip && voip.provider === "ringcentral" && voip.number && voip.username && voip.sipPassword) ? '<span class="badge voip">RingCentral VOIP</span>' : '<span class="badge neutral">no VOIP line</span>';
+  const voipProvider = voip.provider || "";
+  const voipReady = voipProvider && voipComplete(voip) ? '<span class="badge voip">' + esc(voipProviderLabel(voipProvider)) + ' VOIP</span>' : '<span class="badge neutral">no VOIP line</span>';
+  const providers = ["ringcentral","twilio","vonage","plivo","thinq","flowroute","myexotel","asterisk","freepbx","generic"];
+  const provOpts = providers.map((p) => '<option value="' + p + '"' + (voipProvider === p ? " selected" : "") + ">" + esc(voipProviderLabel(p)) + "</option>").join("") + '<option value="custom"' + (!providers.includes(voipProvider) && voipProvider ? " selected" : "") + ">Other / custom SIP</option>";
   return pageShell("My Dashboard - Magic Dialer", `
   <div style="max-width:820px;margin:0 auto;padding:28px 20px 60px">
     <div style="display:flex;align-items:center;gap:14px;margin-bottom:26px">
@@ -430,36 +497,66 @@ function customerHomeHtml(c) {
 
     <div class="card" style="padding:26px;margin-bottom:18px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-        <div style="font-size:14px;font-weight:700;color:#e2e8f0">RingCentral VOIP line</div> ${voipReady}
+        <div style="font-size:14px;font-weight:700;color:#e2e8f0">My VOIP line</div> ${voipReady}
       </div>
-      <div style="color:#7c8aa8;font-size:12px;margin-bottom:14px">Private to this PC only - no one else can see it. When enabled, outbound calls go out over your RingCentral number instead of the PC speaker.</div>
+      <div style="color:#7c8aa8;font-size:12px;margin-bottom:14px">Private to this PC only - no one else can see it. When enabled, outbound calls go out over this line instead of the PC speaker.</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <div><label class="f" for="vNumber">Your RingCentral phone number</label><input id="vNumber" class="inp" value="${esc(voip.number || "")}" placeholder="+12025550100"></div>
+        <div style="grid-column:1 / span 2"><label class="f" for="vProvider">Provider</label>
+          <select id="vProvider" class="inp" style="padding:9px">${provOpts}</select>
+        </div>
+        <div><label class="f" for="vNumber">Outgoing caller ID</label><input id="vNumber" class="inp" value="${esc(voip.number || "")}" placeholder="+12025550100"></div>
         <div><label class="f" for="vExt">Extension (optional)</label><input id="vExt" class="inp" value="${esc(voip.extension || "")}" placeholder="101"></div>
-        <div><label class="f" for="vUser">SIP / Direct-IP username</label><input id="vUser" class="inp" value="${esc(voip.username || "")}" placeholder="App Username"></div>
-        <div><label class="f" for="vPass">SIP / Direct-IP password</label><input id="vPass" type="password" class="inp" value="${esc(voip.sipPassword || "")}" placeholder="App Password"></div>
+        <div class="voipCust"><label class="f" for="vServer">SIP server / domain</label><input id="vServer" class="inp" value="${esc(voip.server || "")}" placeholder="sip.example.com"></div>
+        <div class="voipCust" style="display:flex;gap:8px">
+          <div style="flex:1"><label class="f" for="vPort">Port</label><input id="vPort" class="inp" value="${esc(voip.port || "")}" placeholder="5061"></div>
+          <div style="flex:1"><label class="f" for="vTransport">Transport</label>
+            <select id="vTransport" class="inp" style="padding:9px"><option value="tls"${voip.transport === "tls" || !voip.transport ? " selected" : ""}>TLS</option><option value="udp"${voip.transport === "udp" ? " selected" : ""}>UDP</option><option value="tcp"${voip.transport === "tcp" ? " selected" : ""}>TCP</option></select>
+          </div>
+        </div>
+        <div class="voipCust"><label class="f" for="vUser">SIP username / auth ID</label><input id="vUser" class="inp" value="${esc(voip.username || "")}" placeholder="Account"></div>
+        <div class="voipCust"><label class="f" for="vPass">SIP password</label><input id="vPass" type="password" class="inp" value="${esc(voip.sipPassword || "")}" placeholder="Password"></div>
       </div>
-      <div style="color:#6b7a99;font-size:11.5px;margin-top:12px;line-height:1.5">Enabled in RingCentral Admin &rarr; your user &rarr; Direct IP (SIP) &rarr; generate App Username / App Password. Credentials are stored per-user, never shared.</div>
+      <div style="color:#6b7a99;font-size:11.5px;margin-top:12px;line-height:1.5">Hosted providers (RingCentral, Twilio, ...) fill in their SIP server for you. For a self-hosted dialer (Asterisk, FreePBX, ...) enter its server, port and transport. Credentials are stored per-user, never shared.</div>
     </div>
 
     <button class="btn" id="saveBtn" style="width:100%;padding:14px">Save settings</button>
     <div class="err" id="msg" style="display:block;color:#a7f3d0;font-size:13px;margin-top:12px;text-align:center"></div>
   </div>
   <script>
+    const HOSTED = ${jsonSafe(HOSTED_VOIP_SERVERS)};
+    function voipToggle() {
+      const custom = !HOSTED[document.getElementById('vProvider').value];
+      document.querySelectorAll('.voipCust').forEach((el) => el.style.display = custom ? '' : 'none');
+      if (!custom) {
+        const dflt = HOSTED[document.getElementById('vProvider').value];
+        if (!document.getElementById('vServer').value || document.getElementById('vServer').dataset.autod === '1') {
+          document.getElementById('vServer').value = dflt; document.getElementById('vServer').dataset.autod = '1';
+        }
+      }
+    }
+    document.getElementById('vProvider').addEventListener('change', voipToggle);
+    voipToggle();
     document.getElementById('saveBtn').addEventListener('click', async () => {
       const msg = document.getElementById('msg');
       msg.style.color = '#a7f3d0'; msg.textContent = 'Saving...';
       const token = ${jsonSafe(c.token)};
       const voipPatch = {
-        provider: 'ringcentral',
+        provider: document.getElementById('vProvider').value,
         number: document.getElementById('vNumber').value.trim(),
         extension: document.getElementById('vExt').value.trim(),
+        server: document.getElementById('vServer').value.trim(),
+        port: document.getElementById('vPort').value.trim(),
+        transport: document.getElementById('vTransport').value,
         username: document.getElementById('vUser').value.trim(),
         sipPassword: document.getElementById('vPass').value
       };
+      if (!HOSTED[voipPatch.provider] && !voipPatch.server) {
+        msg.style.color = '#f87171'; msg.textContent = 'Enter the SIP server for this provider first.';
+        return;
+      }
       const r1 = await fetch('/api/customer/'+token, {method:'PATCH', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ product: document.getElementById('cProduct').value, persona: document.getElementById('cName').value, settings: { voip: voipPatch } })});
-      const nums = document.getElementById('cNumbers').value.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
+      const nums = document.getElementById('cNumbers').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
       const r2 = await fetch('/api/customer/'+token+'/calllist', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ numbers: nums })});
       if (r1.ok && r2.ok) { msg.textContent = 'Saved - your agent picks this up on its next heartbeat.'; location.reload(); }
       else { msg.style.color = '#f87171'; msg.textContent = 'Save failed - session expired?'; }
@@ -510,7 +607,8 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         <div style="margin-top:8px;display:flex;gap:6px">
           <button class="btn ghost" title="Rename the agent (persona)" style="padding:4px 9px;font-size:11.5px;color:#a5b4fc" data-token="${c.token}" data-action="qname">Rename</button>
           <button class="btn ghost" title="Numbers this agent should call" style="padding:4px 9px;font-size:11.5px;color:#a5b4fc" data-token="${c.token}" data-action="qnums">Numbers</button>
-          <button class="btn ghost" title="Connect this user's RingCentral line" style="padding:4px 9px;font-size:11.5px;color:${c.voip_ready === 1 ? "#34d399" : "#6b7a99"}" data-token="${c.token}" data-action="qvoip">VOIP ${c.voip_ready === 1 ? "ON" : ""}</button>
+          <button class="btn ghost" title="Connect this user's dialer line" style="padding:4px 9px;font-size:11.5px;color:${c.voip_ready === 1 ? "#34d399" : "#6b7a99"}" data-token="${c.token}" data-action="qvoip">VOIP ${c.voip_ready === 1 ? "ON" : ""}</button>
+          <button class="btn ghost" title="Place a test call through the cloud gateway (over 443, no ports needed on the PC)" style="padding:4px 9px;font-size:11.5px;color:#7dd3fc" data-token="${c.token}" data-action="qdial">Dial test</button>
         </div>
       </td>
     </tr>`;
@@ -701,17 +799,45 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         }
         if (a === 'qvoip') {
           const cur = (cust(token).settings || {}).voip || {};
-          const num = prompt('RingCentral phone number:', cur.number || '');
+          const hosted = Object.keys(HOSTED_VOIP_SERVERS);
+          const provider = prompt('VOIP provider (RingCentral, Twilio, Vonage, Plivo, Flowroute, ...) or a custom value for your own SIP server:', cur.provider || (hosted.includes(cur.provider) ? cur.provider : 'ringcentral'));
+          if (provider == null) return;
+          const p = String(provider).trim().toLowerCase();
+          let server = '';
+          if (!HOSTED_VOIP_SERVERS[p]) {
+            server = prompt('SIP server / domain for this dialer:', cur.server || '');
+            if (server == null) return;
+          }
+          const num = prompt('Outgoing caller ID / number:', cur.number || '');
           if (num == null) return;
-          const username = prompt('SIP / Direct-IP app username:', cur.username || '');
+          const username = prompt('SIP username / auth ID:', cur.username || '');
           if (username == null) return;
-          const sipPassword = prompt('SIP / Direct-IP app password:', cur.sipPassword || '');
+          const sipPassword = prompt('SIP password:', cur.sipPassword || '');
           if (sipPassword == null) return;
           const extension = prompt('Extension (optional, blank to skip):', cur.extension || '');
           if (extension == null) return;
-          const voip = { provider: 'ringcentral', number: num.trim(), username: username.trim(), sipPassword, extension: extension.trim() };
+          const port = prompt('Port (blank = provider default, or 5060/5061):', cur.port || '');
+          if (port == null) return;
+          const transport = prompt('Transport (tls, tcp or udp; blank = auto):', cur.transport || '');
+          if (transport == null) return;
+          const voip = { provider: p, number: num.trim(), username: username.trim(), sipPassword, extension: extension.trim(), server: server.trim(), port: String(port).trim(), transport: String(transport).trim().toLowerCase() };
           await apiFetch('/api/customer/'+token, {method:'PATCH', body: JSON.stringify({settings: {voip}})});
           location.reload(); return;
+        }
+        if (a === 'qdial') {
+          const c = cust(token);
+          const v = prompt('Destination for the test dial (e.g. your phone):', (c.call_list || [])[0] || '');
+          if (v == null || !v.trim()) return;
+          const btn = e.target.closest('[data-action]');
+          btn.disabled = true; btn.textContent = 'dialing...';
+          try {
+            const j = await apiFetch('/api/dial', {method:'POST', body: JSON.stringify({token, number: v.trim()})});
+            alert(j.status === 'error'
+              ? 'Call NOT placed. ' + (j.error || 'Unknown gateway error.')
+              : 'Call placed (' + (j.providerLabel || j.provider) + '), status: ' + j.status);
+          } catch(err) { alert('Dial failed: ' + err.message); }
+          btn.disabled = false; btn.textContent = 'Dial test';
+          return;
         }
       }
       if (e.target.id === 'logout') { await fetch('/logout',{method:'POST'}); location.href='/'; }

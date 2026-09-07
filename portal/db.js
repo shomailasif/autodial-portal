@@ -23,6 +23,27 @@ const crypto = require("node:crypto");
 const USES_PG = !!process.env.DATABASE_URL;
 
 /**
+ * Providers whose SIP server is implied (no server field required).
+ * Any other provider - or a custom SIP dialer - stores its own server.
+ */
+const HOSTED_VOIP_DEFAULTS = {
+  ringcentral: "sip.ringcentral.com",
+  twilio: "edge.sip.twilio.com",
+  vonage: "sip.contact.vonage.com",
+  plivo: "sip.plivo.com",
+  thinq: "sip.thinq.com",
+  flowroute: "sip.flowroute.com",
+  myexotel: "sip.exotel.com",
+};
+
+/** A VOIP line counts as complete only when it has everything needed to place a call. */
+function voipComplete(v) {
+  if (!v || !v.username || !v.sipPassword) return false;
+  if (v.server) return true;                     // explicit SIP server always counts
+  return !!HOSTED_VOIP_DEFAULTS[v.provider];     // hosted providers carry their own default
+}
+
+/**
  * Tenant identity for this portal instance.
  *
  * Each deployed portal runs with its own PORTAL_ID (default "main"). Every
@@ -241,7 +262,7 @@ async function processHeartbeat(db, { token, voipReady }) {
   if (!c) return { ok: false, disabled: true, reason: "unknown" };
   const now = Date.now();
   const s = c.settings || {};
-  const haveVoip = s.voip && s.voip.provider === "ringcentral" && s.voip.number && s.voip.username && s.voip.sipPassword;
+  const haveVoip = voipComplete(s.voip);
   const vp = (voipReady === true || !!haveVoip) ? 1 : 0;
   if (db.pool) {
     await db.pool.query(
@@ -300,7 +321,7 @@ async function updateCustomer(db, token, patch) {
     }
     push("settings", JSON.stringify(merged));
     const v = merged.voip || {};
-    const voipReady = v && v.provider === "ringcentral" && v.number && v.username && v.sipPassword ? 1 : 0;
+    const voipReady = voipComplete(v) ? 1 : 0;
     push("voip_ready", voipReady);
   }
 
