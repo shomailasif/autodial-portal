@@ -99,14 +99,18 @@ async function dialViaSim(ctx, session) {
 // fetch is injectable via ctx.fetch so tests can verify request shape offlin
 async function rcToken(ctx, settings) {
   const fet = ctx.fetch || fetch;
-  const clientId = ctx.env.RC_CLIENT_ID || "";
-  const clientSecret = ctx.env.RC_CLIENT_SECRET || "";
+  // A customer may bring their own RingCentral connection: the keys live on
+  // the customer profile (voip.appClientId/appClientSecret/appJwt) and take
+  // priority over the portal-level env connection (owner's test line).
+  const cust = settings || {};
+  const clientId = String(cust.appClientId || ctx.env.RC_CLIENT_ID || "").trim();
+  const clientSecret = String(cust.appClientSecret || ctx.env.RC_CLIENT_SECRET || "").trim();
   if (!clientId || !clientSecret) {
     throw new Error(
-      "RingCentral driver needs the account's Developer-app Client ID/Secret. Set RC_CLIENT_ID / RC_CLIENT_SECRET on the portal (or paste a personal JWT credential) first."
+      "RingCentral driver needs the account's Developer-app Client ID/Secret. Enter them on the customer's VOIP settings (or set RC_CLIENT_ID / RC_CLIENT_SECRET on the portal) first."
     );
   }
-  const assert = (ctx.env.RC_JWT || "").trim();
+  const assert = String(cust.appJwt || ctx.env.RC_JWT || "").trim();
   const basic = "Basic " + Buffer.from(clientId + ":" + clientSecret).toString("base64");
   if (assert) {
     const tok = await fet("https://platform.ringcentral.com/restapi/oauth/token", {

@@ -519,6 +519,15 @@ function customerHomeHtml(c) {
         </div>
         <div class="voipCust"><label class="f" for="vUser">SIP username / auth ID</label><input id="vUser" class="inp" value="${esc(voip.username || "")}" placeholder="Account"></div>
         <div class="voipCust"><label class="f" for="vPass">SIP password</label><input id="vPass" type="password" class="inp" value="${esc(voip.sipPassword || "")}" placeholder="Password"></div>
+        <div class="rcKeys" style="grid-column:1 / span 2;display:none;margin-top:6px;padding:12px;background:#101625;border:1px solid #243044;border-radius:10px">
+          <div style="font-size:13px;font-weight:700;color:#e2e8f0;margin-bottom:4px">Your own RingCentral connection (optional)</div>
+          <div style="color:#7c8aa8;font-size:11.5px;margin-bottom:10px;line-height:1.5">Leave empty to use this portal's test line. To route calls through your own RingCentral account, create your own REST API app (JWT auth) and paste its keys here - calls then go through your own line, never the portal owner's.</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div><label class="f" for="rcId">App Client ID</label><input id="rcId" class="inp" value="${esc(voip.appClientId || "")}" placeholder="e.g. ZNXC..."></div>
+            <div><label class="f" for="rcSecret">App Client Secret</label><input id="rcSecret" class="inp" value="${esc(voip.appClientSecret || "")}" placeholder="Secret"></div>
+          </div>
+          <div style="margin-top:10px"><label class="f" for="rcJwt">Personal JWT credential (the long token)</label><input id="rcJwt" class="inp" value="${esc(voip.appJwt || "")}" placeholder="eyJ..."></div>
+        </div>
       </div>
       <div style="color:#6b7a99;font-size:11.5px;margin-top:12px;line-height:1.5">Hosted providers (RingCentral, Twilio, ...) fill in their SIP server for you. For a self-hosted dialer (Asterisk, FreePBX, ...) enter its server, port and transport. Credentials are stored per-user, never shared.</div>
     </div>
@@ -531,6 +540,7 @@ function customerHomeHtml(c) {
     function voipToggle() {
       const custom = !HOSTED[document.getElementById('vProvider').value];
       document.querySelectorAll('.voipCust').forEach((el) => el.style.display = custom ? '' : 'none');
+      document.querySelectorAll('.rcKeys').forEach((el) => el.style.display = document.getElementById('vProvider').value === 'ringcentral' ? '' : 'none');
       if (!custom) {
         const dflt = HOSTED[document.getElementById('vProvider').value];
         if (!document.getElementById('vServer').value || document.getElementById('vServer').dataset.autod === '1') {
@@ -552,7 +562,10 @@ function customerHomeHtml(c) {
         port: document.getElementById('vPort').value.trim(),
         transport: document.getElementById('vTransport').value,
         username: document.getElementById('vUser').value.trim(),
-        sipPassword: document.getElementById('vPass').value
+        sipPassword: document.getElementById('vPass').value,
+        appClientId: document.getElementById('rcId').value.trim(),
+        appClientSecret: document.getElementById('rcSecret').value.trim(),
+        appJwt: document.getElementById('rcJwt').value.trim()
       };
       if (!HOSTED[voipPatch.provider] && !voipPatch.server) {
         msg.style.color = '#f87171'; msg.textContent = 'Enter the SIP server for this provider first.';
@@ -824,7 +837,7 @@ function dashboardHtml(rows, calls = [], outbox = []) {
           if (port == null) return;
           const transport = prompt('Transport (tls, tcp or udp; blank = auto):', cur.transport || '');
           if (transport == null) return;
-          const voip = { provider: p, number: num.trim(), username: username.trim(), sipPassword, extension: extension.trim(), server: server.trim(), port: String(port).trim(), transport: String(transport).trim().toLowerCase() };
+          const voip = { provider: p, number: num.trim(), username: username.trim(), sipPassword, extension: extension.trim(), server: server.trim(), port: String(port).trim(), transport: String(transport).trim().toLowerCase(), appClientId: cur.appClientId || "", appClientSecret: cur.appClientSecret || "", appJwt: cur.appJwt || "" };
           await apiFetch('/api/customer/'+token, {method:'PATCH', body: JSON.stringify({settings: {voip}})});
           location.reload(); return;
         }
