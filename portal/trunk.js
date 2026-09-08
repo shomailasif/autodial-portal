@@ -163,6 +163,7 @@ async function dialViaRingCentral(ctx, session, settings) {
     session.status = "ringing";
     session.providerRef = j.id ? String(j.id) : "";
     session.providerLabel = "RingCentral (RingOut/443)";
+    if (session.providerRef && !ctx.fetch) pollRingOut(ctx, session, token, session.providerRef);
     return session;
   } catch (e) {
     return failSession(session, "RingOut request failed: " + e.message);
@@ -173,6 +174,39 @@ function normalizeNumber(n) {
   let s = String(n || "").replace(/[^+\d]/g, "");
   if (s && !s.startsWith("+")) s = "+" + s;
   return s;
+}
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* Best-effort follow-up of a launched RingOut so the dashboard reports the
+ * REAL outcome (connected / no answer / invalid) instead of just "ringing".
+ * Only runs when the portal is using the live network (no injected fetch),
+ * so offline test suites never wait on it. */
+async function pollRingOut(ctx, session, token, ringoutId) {
+  try { await delay(12000); } catch {}
+  const fet = ctx.fetch || fetch;
+  try {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const r = await fet(`https://platform.ringcentral.com/restapi/v1.0/account/~/extension/~/ring-out/${ringoutId}`, {
+          headers: { Authorization: "Bearer " + token },
+        });
+        if (!r.ok) { await delay(10000); continue; }
+        const s = await r.json();
+        const text = String((s && (s.status || s.reason || "")) || "");
+        const low = text.toLowerCase();
+        let outcome = null;
+        if (/call connected|connected|completed|answered|success/.test(low)) outcome = { status: "connected", note: text, error: session.error || null };
+        else if (/invalid|error|fail|denied|unavailable|no ?answer|not answered/.test(low)) outcome = { status: "error", note: text, error: "RingOut did not connect: " + text };
+        else if (/in progress|progressing|ringing|first leg|called number|callee|originated/.test(low)) outcome = { status: "ringing", note: text, error: null };
+        if (outcome) {
+          try { Object.assign(session, { status: outcome.status, ringOutNote: outcome.note || null, error: outcome.error }); } catch {}
+          if (outcome.status === "connected" || outcome.status === "error") return;
+        }
+      } catch {}
+      await delay(12000);
+    }
+  } catch {}
 }
 
 function encode(obj) {
