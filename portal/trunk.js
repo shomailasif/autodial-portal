@@ -87,40 +87,58 @@ async function dialViaSim(ctx, session) {
 }
 
 // RingCentral driver - RingOut over REST (443). No SIP port on any PC.
-// App-level OAuth creds come from the portal env (RC_CLIENT_ID /
-// RC_CLIENT_SECRET) + the customer account's authorization. fetch is
-// injectable via ctx.fetch so tests can verify request shape offline.
-async function dialViaRingCentral(ctx, session, settings) {
+//
+// Two app-credential paths are supported, chosen by what the portal env
+// provides:
+//   1. RC_JWT - a pre-generated JWT assertion ("personal JWT credential")
+//      created in the RC Developer Console under the app's Authentication
+//      section. The console mints this token with the correct owner
+//      identity, so the portal needs no private key. One env var total.
+//   2. RC_CLIENT_ID + RC_CLIENT_SECRET - classic password grant; kept for
+//      accounts where RingCentral still allows it.
+// fetch is injectable via ctx.fetch so tests can verify request shape offlin
+async function rcToken(ctx, settings) {
   const fet = ctx.fetch || fetch;
   const clientId = ctx.env.RC_CLIENT_ID || "";
   const clientSecret = ctx.env.RC_CLIENT_SECRET || "";
   if (!clientId || !clientSecret) {
-    return failSession(
-      session,
-      "RingCentral driver needs the account's Developer-app Client ID/Secret. Set RC_CLIENT_ID / RC_CLIENT_SECRET on the portal (and authorize this customer) first."
+    throw new Error(
+      "RingCentral driver needs the account's Developer-app Client ID/Secret. Set RC_CLIENT_ID / RC_CLIENT_SECRET on the portal (or paste a personal JWT credential) first."
     );
   }
+  const assert = (ctx.env.RC_JWT || "").trim();
+  const basic = "Basic " + Buffer.from(clientId + ":" + clientSecret).toString("base64");
+  if (assert) {
+    const tok = await fet("https://platform.ringcentral.com/restapi/oauth/token", {
+      method: "POST",
+      headers: { Authorization: basic, "Content-Type": "application/x-www-form-urlencoded" },
+      body: encode({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: assert }),
+    });
+    if (!tok.ok) throw new Error("RingCentral JWT token rejected (HTTP " + tok.status + ") - check RC_JWT / RC_CLIENT_ID / RC_CLIENT_SECRET.");
+    return (await tok.json()).access_token;
+  }
+  const tok = await fet("https://platform.ringcentral.com/restapi/v1.0/oauth/token", {
+    method: "POST",
+    headers: { Authorization: basic, "Content-Type": "application/x-www-form-urlencoded" },
+    body: encode({
+      grant_type: "password",
+      username: normalizeNumber(settings.number),
+      password: settings.sipPassword,
+      extension: settings.extension || "101",
+    }),
+  });
+  if (!tok.ok) throw new Error("RingCentral password token rejected (HTTP " + tok.status + ") - check the customer's number/password.");
+  return (await tok.json()).access_token;
+}
+
+async function dialViaRingCentral(ctx, session, settings) {
+  const fet = ctx.fetch || fetch;
   const number = normalizeNumber(settings.number);
   const destination = session.destination;
-  const extension = settings.extension || "101";
 
   let token;
   try {
-    const tok = await fet("https://platform.ringcentral.com/restapi/v1.0/oauth/token", {
-      method: "POST",
-      headers: {
-        Authorization: "Basic " + Buffer.from(clientId + ":" + clientSecret).toString("base64"),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: encode({
-        grant_type: "password",
-        username: number,
-        password: settings.sipPassword,
-        extension: extension,
-      }),
-    });
-    if (!tok.ok) return failSession(session, "RingCentral token rejected (HTTP " + tok.status + ") - check the customer's number/password.");
-    token = (await tok.json()).access_token;
+    token = await rcToken(ctx, settings);
   } catch (e) {
     return failSession(session, "RingCentral token fetch failed: " + e.message);
   }
