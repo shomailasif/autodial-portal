@@ -88,8 +88,10 @@ async function dialViaSim(ctx, session) {
 
 // RingCentral driver - RingOut over REST (443). No SIP port on any PC.
 // App-level OAuth creds come from the portal env (RC_CLIENT_ID /
-// RC_CLIENT_SECRET) + the customer account's authorization.
+// RC_CLIENT_SECRET) + the customer account's authorization. fetch is
+// injectable via ctx.fetch so tests can verify request shape offline.
 async function dialViaRingCentral(ctx, session, settings) {
+  const fet = ctx.fetch || fetch;
   const clientId = ctx.env.RC_CLIENT_ID || "";
   const clientSecret = ctx.env.RC_CLIENT_SECRET || "";
   if (!clientId || !clientSecret) {
@@ -104,7 +106,7 @@ async function dialViaRingCentral(ctx, session, settings) {
 
   let token;
   try {
-    const tok = await fetch("https://platform.ringcentral.com/restapi/v1.0/oauth/token", {
+    const tok = await fet("https://platform.ringcentral.com/restapi/v1.0/oauth/token", {
       method: "POST",
       headers: {
         Authorization: "Basic " + Buffer.from(clientId + ":" + clientSecret).toString("base64"),
@@ -124,7 +126,7 @@ async function dialViaRingCentral(ctx, session, settings) {
   }
 
   try {
-    const ringout = await fetch("https://platform.ringcentral.com/restapi/v1.0/account/~/extension/~/ring-out", {
+    const ringout = await fet("https://platform.ringcentral.com/restapi/v1.0/account/~/extension/~/ring-out", {
       method: "POST",
       headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -192,6 +194,7 @@ async function placeCall(ctx, { customer, destination }) {
     provider: settings.provider || "generic",
     providerLabel: settings.provider || "Generic SIP",
     destination: d,
+    mediaPath: LIVE_PROVIDERS.has(settings.provider) ? "/ws/media/" + id : null,
     startedAt: Date.now(),
   };
   CALL_SESSIONS.set(sessionKey(ctx.portalId, id), session);

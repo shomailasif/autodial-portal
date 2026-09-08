@@ -7,6 +7,7 @@ const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader } = require("./auth");
 const { searchLeads } = require("./find-leads");
 const trunk = require("./trunk");
+const media = require("./media");
 
 // Optional tenant identity for a deployed portal (set PORTAL_NAME to brand the
 // console). Every portal already has its own PORTAL_ID and admin password; this
@@ -199,7 +200,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       if (!c) return send(404, { error: "Customer not found" });
       try {
         const s = await trunk.placeCall(gatewayCtx, { customer: c, destination: body.number });
-        return send(200, { ok: true, id: s.id, status: s.status, provider: s.provider, providerLabel: s.providerLabel, destination: s.destination, error: s.error || null });
+        return send(200, { ok: true, id: s.id, status: s.status, provider: s.provider, providerLabel: s.providerLabel, destination: s.destination, mediaPath: s.mediaPath, error: s.error || null });
       } catch (e) {
         const code = e.code === "BAD_NUMBER" || e.code === "NO_DIALER" ? 400 : 500;
         return send(code, { error: e.message });
@@ -210,7 +211,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const s = trunk.getSession(gatewayCtx.portalId, mDialGet.token);
       if (!s) return send(404, { error: "No such call" });
       if (!isAdmin && s.token !== myToken) return send(403, { error: "Not your call" });
-      return send(200, { id: s.id, status: s.status, provider: s.provider, providerLabel: s.providerLabel, destination: s.destination, startedAt: s.startedAt, error: s.error || null });
+      return send(200, { id: s.id, status: s.status, provider: s.provider, providerLabel: s.providerLabel, destination: s.destination, startedAt: s.startedAt, mediaPath: s.mediaPath, mediaActive: s.mediaActive === true, mediaBytesIn: s.mediaBytesIn || 0, mediaBytesOut: s.mediaBytesOut || 0, error: s.error || null });
     }
     if (mDialHang && method === "POST") {
       if (!isAdmin && !myToken) return send(401, { error: "Login required" });
@@ -315,6 +316,9 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
 
     return send(404, { error: "Not found" });
   });
+
+  // Cloud call gateway: the 443 media channel rides the same HTTP server.
+  media.install(server, { getSession: (id) => trunk.getSession(gatewayCtx.portalId, id) });
 
   server.listen(port, () => {
     console.log(`[magic-dialer] Platform portal running at http://localhost:${port}`);
