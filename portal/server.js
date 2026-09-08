@@ -1,7 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById, updateCustomer, setCallList, saveLeads } = require("./db");
+const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById, updateCustomer, setCallList, saveLeads, getPortalSettings, savePortalSettings } = require("./db");
 const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("../shared/protocol");
 const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader } = require("./auth");
@@ -26,6 +26,13 @@ const tenantName = (process.env.PORTAL_NAME || "").trim();
 
 async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, adminPassword } = {}) {
   const db = await openDb(dbPath);
+  // App keys saved from the dashboard (e.g. RingCentral Developer-app
+  // credentials) are loaded into the process env so trunk drivers see them.
+  {
+    const s = await getPortalSettings(db);
+    if (s.rc_client_id) process.env.RC_CLIENT_ID = s.rc_client_id;
+    if (s.rc_client_secret) process.env.RC_CLIENT_SECRET = s.rc_client_secret;
+  }
   const gatewayCtx = { portalId: db.portalId, env: process.env };
 
   setInterval(() => { markStaleOffline(db, STALE_AFTER_MS + 2000); }, HEARTBEAT_INTERVAL_MS);
@@ -183,6 +190,25 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const c = await setDisabled(db, body.token, body.disabled ? 1 : 0);
       if (!c) return send(404, { error: "Customer not found" });
       return send(200, { ok: true, disabled: c.disabled === 1, token: c.token });
+    }
+
+    // --- App keys (ADMIN ONLY; e.g. RingCentral Developer-app creds) ---
+    // Stored in the portal DB so real calls never depend on the host's env.
+    if (url.pathname === "/api/app-creds" && method === "GET") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const s = await getPortalSettings(db);
+      return send(200, { clientIdSet: !!s.rc_client_id, secretSet: !!s.rc_client_secret });
+    }
+    if (url.pathname === "/api/app-creds" && method === "POST") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const body = await readBody(req);
+      const s = await savePortalSettings(db, {
+        clientId: String(body.clientId || "").trim(),
+        clientSecret: String(body.clientSecret || "").trim(),
+      });
+      process.env.RC_CLIENT_ID = s.rc_client_id || "";
+      process.env.RC_CLIENT_SECRET = s.rc_client_secret || "";
+      return send(200, { ok: true, clientIdSet: !!s.rc_client_id, secretSet: !!s.rc_client_secret });
     }
 
     // --- Cloud call gateway: dialer control plane ---
@@ -669,6 +695,21 @@ function dashboardHtml(rows, calls = [], outbox = []) {
         ${stat("Avg score", avgScore, "#94a3b8")}
       </div>
 
+      <div class="card" style="padding:18px;margin-bottom:24px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+          <div>
+            <div style="font-weight:700;font-size:13px;color:#c7d2fe">RingCentral app keys</div>
+            <div style="color:#7c8aa8;font-size:12px;margin-top:2px">Real outbound calls need a RingCentral Developer app. Enter its Client ID + Secret once here - no hosting console needed. Make it in 2 minutes at developer.ringcentral.com (REST API App, Password Grant), then paste the two keys.</div>
+          </div>
+          <button class="btn" id="saveCreds" style="padding:6px 14px">Save keys</button>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <input id="rcId" class="inp" type="password" placeholder="App Key / Client ID" autocomplete="off" style="flex:1;min-width:200px">
+          <input id="rcSec" class="inp" type="password" placeholder="App Secret / Client Secret" autocomplete="off" style="flex:1;min-width:220px">
+          <span id="credsHint" style="color:#7c8aa8;font-size:12px;align-self:center"></span>
+        </div>
+      </div>
+
       <div id="section-customers">
         <div style="display:flex;justify-content:space-between;align-items:baseline;margin:0 0 10px">
           <h2 style="font-size:15px;font-weight:700;color:#c7d2fe;margin:0">Customers</h2>
@@ -1031,6 +1072,26 @@ function dashboardHtml(rows, calls = [], outbox = []) {
     document.addEventListener('click', (e) => {
       if (e.target.closest('[data-close]')) closeModals();
     });
+
+    // --- RingCentral app keys (dashboard entry point - no hosting console) ---
+    async function loadCreds(){
+      try {
+        const j = await apiFetch('/api/app-creds');
+        $('credsHint').textContent = j.clientIdSet && j.secretSet ? 'Keys are set - Dial test is live.' : 'No keys set yet - Dial test will report the missing keys.';
+        $('credsHint').style.color = (j.clientIdSet && j.secretSet) ? '#34d399' : '#fbbf24';
+      } catch {}
+    }
+    $('saveCreds').addEventListener('click', async () => {
+      const b = $('saveCreds'); b.disabled = true;
+      try {
+        const j = await apiFetch('/api/app-creds', {method:'POST', body: JSON.stringify({ clientId: $('rcId').value, clientSecret: $('rcSec').value })});
+        $('rcId').value=''; $('rcSec').value='';
+        $('credsHint').textContent = j.clientIdSet && j.secretSet ? 'Saved - Dial test is live now.' : 'Saved - keys cleared.';
+        $('credsHint').style.color = (j.clientIdSet && j.secretSet) ? '#34d399' : '#fbbf24';
+      } catch(e) { $('credsHint').textContent = e.message; $('credsHint').style.color='#f87171'; }
+      b.disabled = false;
+    });
+    loadCreds();
 
     scheduleAutoReload(20000);
   </script>`);

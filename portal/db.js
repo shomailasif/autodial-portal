@@ -129,6 +129,11 @@ async function openDb(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_calls_portal ON calls(portal_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_calls_customer ON calls(customer_token);
     CREATE INDEX IF NOT EXISTS idx_customers_machine ON customers(machine_id, portal_id);
+    CREATE TABLE IF NOT EXISTS portal_settings (
+      portal_id TEXT PRIMARY KEY,
+      rc_client_id TEXT,
+      rc_client_secret TEXT
+    );
   `);
   return { sqlite: db, portalId: sid };
 }
@@ -183,12 +188,13 @@ async function initPostgres(pool) {
     await pool.query(ddl).catch(() => {}); // ignore benign duplicates / lock races
   }
   for (const idx of [
-    "CREATE INDEX IF NOT EXISTS idx_customers_portal ON customers(portal_id)",
+"CREATE INDEX IF NOT EXISTS idx_customers_portal ON customers(portal_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_portal ON calls(portal_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_calls_customer ON calls(customer_token)",
     "CREATE INDEX IF NOT EXISTS idx_customers_machine ON customers(machine_id, portal_id)",
+    "CREATE TABLE IF NOT EXISTS portal_settings (portal_id TEXT PRIMARY KEY, rc_client_id TEXT, rc_client_secret TEXT)",
   ]) {
-    await pool.query(idx).catch(() => {});
+    await pool.query(ddl).catch(() => {}); // ignore benign duplicates / lock races
   }
 }
 
@@ -377,6 +383,44 @@ async function saveLeads(db, token, leads) {
   return getCustomerByToken(db, token);
 }
 
+// Per-portal app keys (e.g. RingCentral Developer-app Client ID/Secret). Stored
+// in the portal's own database so the admin can enter them from the dashboard
+// without touching the host's environment variables.
+async function getPortalSettings(db) {
+  if (db.pool) {
+    const r = await db.pool.query("SELECT rc_client_id, rc_client_secret FROM portal_settings WHERE portal_id = $1", [db.portalId]);
+    return r.rows[0] || {};
+  }
+  return db.sqlite.prepare("SELECT rc_client_id, rc_client_secret FROM portal_settings WHERE portal_id = ?").get(db.portalId) || {};
+}
+
+async function savePortalSettings(db, { clientId, clientSecret }) {
+  const has = !!clientId || !!clientSecret;
+  if (db.pool) {
+    if (has) {
+      await db.pool.query(
+        `INSERT INTO portal_settings (portal_id, rc_client_id, rc_client_secret)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (portal_id) DO UPDATE SET rc_client_id = EXCLUDED.rc_client_id, rc_client_secret = EXCLUDED.rc_client_secret`,
+        [db.portalId, clientId || null, clientSecret || null]
+      );
+    } else {
+      await db.pool.query("DELETE FROM portal_settings WHERE portal_id = $1", [db.portalId]);
+    }
+    return getPortalSettings(db);
+  }
+  if (has) {
+    db.sqlite.prepare(
+      `INSERT INTO portal_settings (portal_id, rc_client_id, rc_client_secret)
+       VALUES (?, ?, ?)
+       ON CONFLICT (portal_id) DO UPDATE SET rc_client_id = excluded.rc_client_id, rc_client_secret = excluded.rc_client_secret`
+    ).run(db.portalId, clientId || null, clientSecret || null);
+  } else {
+    db.sqlite.prepare("DELETE FROM portal_settings WHERE portal_id = ?").run(db.portalId);
+  }
+  return getPortalSettings(db);
+}
+
 async function setCallListRaw(db, token, arr) {
   const c = await getCustomerByToken(db, token);
   if (!c) return null;
@@ -507,5 +551,7 @@ module.exports = {
   updateCustomer,
   setCallList,
   saveLeads,
+  getPortalSettings,
+  savePortalSettings,
   USES_PG,
 };
