@@ -76,7 +76,10 @@ const NOISE_RE = /(download|watch|episode|gameplay|trailer|game\b|app store|play
 /** Only keep snippets that are topical for the product and read cleanly. */
 function usableBullet(raw, product) {
   const t = cleanBullet(raw);
-  if (t.length < 20 || t.length > 300) return null;
+  if (t.length < 25 || t.length > 300) return null;
+  if (/\s\|\s/.test(t)) return null;
+  if (!/[.!?]/.test(t)) return null;
+  if (t.split(" ").length < 3) return null;
   if (NOISE_RE.test(t)) return null;
   const words = String(product || "").toLowerCase().split(/\s+/)
     .map((w) => w.replace(/\W/g, ""))
