@@ -55,19 +55,13 @@ function hashPassword(password, salt) {
 function authenticate(password, override) {
   const list = admins();
   if (list && list.length) {
-    const attempt = Buffer.from(String(password || ""));
     for (const a of list) {
-      const expected = Buffer.from(hashPassword(password, a.salt), "hex");
-      if (expected.length === attempt.length) {
-        let diff = 0;
-        for (let i = 0; i < expected.length; i++) diff |= expected[i] ^ attempt[i];
-        if (diff === 0) return { id: a.id || a.email, email: a.email, name: a.name || "Admin" };
-      } else {
-        // Timing-safe path for mismatched lengths.
-        let diff = 0;
-        for (let i = 0; i < attempt.length; i++) diff |= attempt[i] ^ expected[i % expected.length];
-        if (diff === 0 && attempt.length === 0 && expected.length === 0) return null;
-      }
+      const given = Buffer.from(hashPassword(password, a.salt), "hex");
+      const expected = Buffer.from(a.hash, "hex");
+      if (given.length !== expected.length) continue;
+      let diff = 0;
+      for (let i = 0; i < expected.length; i++) diff |= expected[i] ^ given[i];
+      if (diff === 0) return { id: a.id || a.email, email: a.email, name: a.name || "Admin" };
     }
     return null;
   }
