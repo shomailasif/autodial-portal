@@ -1,0 +1,16 @@
+[
+  {
+    "id": "admin-owner",
+    "email": "shomailasif@gmail.com",
+    "name": "Shomail Asif",
+    "salt": "62e9f1c15c664e5cbabf8a541c7a4839",
+    "hash": "a6fe12b435cec77724348809228d28a4d3c494d4f5d91292a7836dd54860c1b4"
+  },
+  {
+    "id": "admin-ops",
+    "email": "hbasifalansai@gmail.com",
+    "name": "Basif",
+    "salt": "ce972505a050eca698131df92148fd7a",
+    "hash": "a0597203a01801cc4d1b12770b6620218b11333d006c05a0c999acfc65e6064a"
+  }
+]

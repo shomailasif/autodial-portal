@@ -4,7 +4,7 @@ const path = require("node:path");
 const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById, updateCustomer, setCallList, saveLeads } = require("./db");
 const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("../shared/protocol");
 const { sendEmail, listOutbox } = require("./mailer");
-const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader } = require("./auth");
+const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, authenticate, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader } = require("./auth");
 const { searchLeads } = require("./find-leads");
 const trunk = require("./trunk");
 const media = require("./media");
@@ -80,8 +80,9 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
     if (url.pathname === "/login" && method === "GET") return send(200, loginHtml());
     if (url.pathname === "/login" && method === "POST") {
       const body = await readBody(req);
-      if (checkPassword(body.password, adminPassword)) {
-        return send(200, { ok: true }, { "Set-Cookie": `session=${issueSession()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400` });
+      const who = authenticate(body.password, adminPassword);
+      if (who) {
+        return send(200, { ok: true, name: who.name }, { "Set-Cookie": `session=${issueSession(who.id)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400` });
       }
       return send(401, { error: "Wrong password" });
     }
