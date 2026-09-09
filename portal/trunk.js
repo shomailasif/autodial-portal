@@ -15,6 +15,7 @@
 const crypto = require("node:crypto");
 const net = require("node:net");
 const tls = require("node:tls");
+const { sipCallOnce } = require("./softphone");
 
 // Hosted provider -> default SIP registration domain (used by the cloud to
 // register the trunk later, and by driver selection today).
@@ -206,6 +207,47 @@ async function rcToken(ctx, settings) {
 }
 
 async function dialViaRingCentral(ctx, session, settings) {
+  // Preferred path: direct SIP soft-phone trunk (TLS + SRTP-SDES), which is
+  // fully unattended (no human ever answers the origin leg). Used when the
+  // customer's VOIP settings carry the SIP device credentials (username +
+  // sipPassword, plus optional authId / host / port). Falls back to RingOut
+  // REST for accounts that only have Developer-app credentials.
+  const user = String(settings.username || "").trim();
+  const sipPass = String(settings.sipPassword || "").trim();
+  if (user && sipPass) {
+    session.status = "dialing";
+    session.providerLabel = "RingCentral SIP (TLS+SRTP)";
+    session.provider = "ringcentral-sip";
+    const talkMs = Math.max(2000, 1000 * Number(settings.speakSeconds || 20));
+    sipCallOnce({
+      user,
+      pass: sipPass,
+      authId: String(settings.authId || user).trim(),
+      domain: String(settings.domain || "sip.ringcentral.com"),
+      proxy: String(settings.host || "sip40.ringcentral.com"),
+      port: Number(settings.port || 5096),
+      number: session.destination,
+      durationMs: talkMs,
+      codec: settings.codec === "opus" ? "opus" : "pcmu",
+    }).then((r) => {
+      if (!r.ok) {
+        failSession(session, "RingCentral SIP call failed: " + (r.last || "unknown") + (r.steps && r.steps.length ? " [" + r.steps.join(" -> ") + "]" : ""));
+        return;
+      }
+      session.status = "connected";
+      session.answeredAt = session.answeredAt || Date.now();
+      session.endedAt = Date.now();
+      session.sip = {
+        steps: r.steps,
+        remoteIp: (r.media || {}).remoteIp,
+        remotePort: (r.media || {}).remotePort,
+        srtp: !!(r.media || {}).remoteKey,
+        byes: r.extra || r.last || null,
+      };
+    });
+    return session;
+  }
+
   const fet = ctx.fetch || fetch;
   const number = normalizeNumber(settings.number);
   const destination = session.destination;
