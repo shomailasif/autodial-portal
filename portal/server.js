@@ -255,6 +255,22 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       if (!r1.ok) out.tls = await trunk.sipRegisterOnce(u, p, e, "tls");
       return send(200, out);
     }
+    if (url.pathname === "/api/dev/rcdevices" && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Admin login required" });
+      const body = await readBody(req);
+      const settings = {
+        number: String(body.number || "+14807166685"),
+        extension: String(body.extension || "101"),
+        username: String(body.username || "+14807166685"),
+        sipPassword: String(body.password || ""),
+      };
+      try {
+        const out = await trunk.rcDeviceInfo(dialCtx, settings);
+        return send(200, out);
+      } catch (e) {
+        return send(500, { error: e.message });
+      }
+    }
     if (mTwSt && (method === "POST" || method === "GET")) {
       const sid = String(body.CallSid || body.CallSid || "");
       const st = String(body.CallStatus || body.Status || "");

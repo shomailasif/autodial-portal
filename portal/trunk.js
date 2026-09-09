@@ -167,6 +167,25 @@ function twilioWebhook(portalId, sid, status) {
 //   2. RC_CLIENT_ID + RC_CLIENT_SECRET - classic password grant; kept for
 //      accounts where RingCentral still allows it.
 // fetch is injectable via ctx.fetch so tests can verify request shape offlin
+async function rcDeviceInfo(ctx, settings) {
+  const fet = ctx.fetch || fetch;
+  const token = await rcToken(ctx, settings);
+  const list = await fet("https://platform.ringcentral.com/restapi/v1.0/account/~/extension/~/device", { headers: { Authorization: "Bearer " + token, Accept: "application/json" } });
+  if (!list.ok) return { error: "device list HTTP " + list.status };
+  const devices = ((await list.json()).records || []).map((d) => ({ id: d.id, name: d.name || null, type: d.type || null, apiType: d.apiType || null, model: (d.phoneLines || [])[0] && (d.phoneLines[0].emergencyAddress || {}) }));
+  const out = [];
+  for (const d of devices) {
+    let sip = null;
+    try {
+      const r = await fet("https://platform.ringcentral.com/restapi/v1.0/account/~/extension/~/device//sip-info", { headers: { Authorization: "Bearer " + token, Accept: "application/json" } });
+      if (r.ok) sip = await r.json();
+    } catch {}
+    out.push({ id: d.id, name: d.name, type: d.type, apiType: d.apiType, sipInfo: sip ? { domain: sip.domain, outboundProxies: sip.outboundProxies, userName: sip.userName, authorizationId: sip.authorizationId, transport: sip.transport, hasPassword: !!(sip.password) } : null });
+  }
+  return { devices: out };
+}
+
+
 async function rcToken(ctx, settings) {
   const fet = ctx.fetch || fetch;
   // A customer may bring their own RingCentral connection: the keys live on
@@ -540,6 +559,7 @@ module.exports = {
   hangUp,
   twilioWebhook,
   sipRegisterOnce,
+  rcDeviceInfo,
   startBatch,
   stopBatch,
   getBatch,
