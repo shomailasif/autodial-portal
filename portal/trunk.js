@@ -224,7 +224,7 @@ async function dialViaRingCentral(ctx, session, settings) {
       pass: sipPass,
       authId: String(settings.authId || user).trim(),
       domain: String(settings.domain || "sip.ringcentral.com"),
-      proxy: String(settings.host || "sip40.ringcentral.com"),
+      proxy: String(settings.host || settings.server || "sip40.ringcentral.com"),
       port: Number(settings.port || 5096),
       number: session.destination,
       durationMs: talkMs,
