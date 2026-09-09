@@ -512,7 +512,11 @@ function sipRegisterOnce(o) {
       lines.push("Content-Length: 0", "", "");
       return lines.join("\r\n");
     };
+    let settled = false;
     const done = (ok, line, extra) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardGate);
       try { sock.destroy(); } catch {}
       resolve({ ok, host: viaHost, port, proto, user, authId: authUser, ext, steps, pass: "(hidden)", last: line, extra });
     };
@@ -520,7 +524,8 @@ function sipRegisterOnce(o) {
     const sock = proto === "tls"
       ? tls.connect({ port, host: viaHost, servername: viaHost.split(":")[0], rejectUnauthorized: false }, onConn)
       : net.connect(port, viaHost, onConn);
-    sock.setTimeout(12000);
+    const hardGate = setTimeout(() => done(false, "no response (network or firewall)"), 11000);
+    sock.setTimeout(8000);
     let buf = "";
     sock.on("data", (d) => {
       buf += d.toString("ascii");
