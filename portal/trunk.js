@@ -605,6 +605,18 @@ function sipRegisterOnce(o) {
   });
 }
 
+/** Dev diagnostic: place one full RC SIP call and return the raw result.
+ *  Retries a few times to ride through SBC registration cooldowns. */
+async function sipCallRetry(opts, attempts = 3, gapMs = 20000) {
+  let r = null;
+  for (let i = 0; i < attempts; i++) {
+    r = await sipCallOnce(opts);
+    if (r.ok) return r;
+    if (i < attempts - 1) await delay(gapMs);
+  }
+  return r;
+}
+
 module.exports = {
   HOSTED_VOIP_SERVERS,
   voipComplete,
@@ -615,6 +627,7 @@ module.exports = {
   hangUp,
   twilioWebhook,
   sipRegisterOnce,
+  sipCallRetry,
   startBatch,
   stopBatch,
   getBatch,

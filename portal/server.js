@@ -263,6 +263,40 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       }
       return send(200, out);
     }
+    if (url.pathname === "/api/dev/sipcall" && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const body = await readBody(req);
+      const u = String(body.username || "").replace(/[^0-9+]/g, "");
+      const p = String(body.password || "");
+      const a = String(body.authId || "");
+      const number = String(body.number || "").replace(/[^0-9+]/g, "");
+      if (!u || !p || !number) return send(400, { error: "username, password and number required" });
+      const r = await trunk.sipCallRetry({
+        user: u,
+        pass: p,
+        authId: a || u,
+        domain: String(body.domain || "sip.ringcentral.com"),
+        proxy: String(body.host || "sip40.ringcentral.com"),
+        port: Number(body.port || 5096),
+        number,
+        durationMs: Math.max(2000, Number(body.durationMs || 5000)),
+        codec: body.codec === "opus" ? "opus" : "pcmu",
+      });
+      return send(200, {
+        ok: r.ok,
+        status: r.status,
+        last: r.last,
+        steps: r.steps || [],
+        media: {
+          ip: (r.media || {}).ip,
+          rtpPort: (r.media || {}).port,
+          remoteIp: (r.media || {}).remoteIp,
+          remotePort: (r.media || {}).remotePort,
+          srtpKey: !!(r.media || {}).remoteKey,
+          inboundAudio: !!(r.media || {}).inboundUnlocked,
+        },
+      });
+    }
     if (mTwSt && (method === "POST" || method === "GET")) {
       const sid = String(body.CallSid || body.CallSid || "");
       const st = String(body.CallStatus || body.Status || "");

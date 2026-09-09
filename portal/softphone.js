@@ -231,24 +231,41 @@ function sipCallOnce(o) {
     const raor = () => `sip:${number}@${domain}`;
     const from = () => `sip:${user}@${domain}`;
 
-    const digest = (method, uri) => {
+    // REGISTER uses the exact proven challenge-response shape (no qop -> md5
+    // fallback), byte-compatible with the recipe that registers reliably.
+    const regAuth = (method, uri) => {
+      if (!st.nonce) return null;
       const HA1 = md5(`${st.authUser}:${domain}:${pass}`);
-      const HA2 = md5(`${method}:${uri}`);
-      return `Digest algorithm="MD5", username="${st.authUser}", realm="${domain}", nonce="${st.nonce}", uri="${uri}", response="${md5(`${HA1}:${st.nonce}:${HA2}`)}"`;
+      let resp;
+      if (st.qop) {
+        const nc = "00000001", cn = crypto.randomBytes(4).toString("hex");
+        resp = md5(`${HA1}:${st.nonce}:${nc}:${cn}:${st.qop}:${md5(method + ":" + uri)}`);
+        return `Authorization: Digest username="${st.authUser}", realm="${st.realm || domain}", nonce="${st.nonce}", uri="${uri}", qop=${st.qop}, nc=${nc}, cnonce="${cn}", response="${resp}"`;
+      }
+      resp = md5(`${HA1}:${st.nonce}:${md5(method + ":" + uri)}`);
+      return `Authorization: Digest username="${st.authUser}", realm="${st.realm || domain}", nonce="${st.nonce}", uri="${uri}", response="${resp}"`;
+    };
+
+    // INVITE/BYE carry Proxy-Authorization (SDK-proven digest form).
+    const inviteDigest = (method) => {
+      if (!st.nonce) return null;
+      const HA1 = md5(`${st.authUser}:${domain}:${pass}`);
+      const HA2 = md5(method + ":sip:" + domain);
+      return `Proxy-Authorization: Digest algorithm="MD5", username="${st.authUser}", realm="${domain}", nonce="${st.nonce}", uri="sip:${domain}", response="${md5(`${HA1}:${st.nonce}:${HA2}`)}"`;
     };
 
     const buildRegister = (cseq) => [
       "REGISTER " + regAor + " SIP/2.0",
-      `Via: SIP/2.0/TLS ${proxy};rport;branch=z9hG4bK-${crypto.randomUUID()};alias`,
+      "Via: SIP/2.0/TLS " + proxy + ";branch=z9hG4bK" + crypto.randomBytes(6).toString("hex"),
       "Max-Forwards: 70",
-      "From: <" + regContact + ">;tag=" + crypto.randomUUID(),
+      "From: <" + regContact + ">;tag=" + crypto.randomBytes(6).toString("hex"),
       "To: <" + regContact + ">",
       "Call-ID: " + crypto.randomBytes(8).toString("hex"),
       "CSeq: " + cseq + " REGISTER",
       "Contact: <" + regContact + ">",
       "Expires: 300",
       "User-Agent: MagicDialer-SIP/0.1",
-      st.nonce ? `Authorization: ${digest("REGISTER", regAor)}` : null,
+      regAuth("REGISTER", regAor),
       "Content-Length: 0",
       "",
       "",
@@ -292,7 +309,7 @@ function sipCallOnce(o) {
         "Content-Type: application/sdp",
         "User-Agent: MagicDialer-SIP/0.1",
       ];
-      if (st.nonce) h.push(`Proxy-Authorization: ${digest("INVITE", "sip:" + domain)}`);
+      if (st.nonce) h.push(inviteDigest("INVITE"));
       h.push(`Content-Length: ${Buffer.byteLength(sdp)}`, "", sdp);
       return h.join("\r\n");
     };
@@ -319,7 +336,7 @@ function sipCallOnce(o) {
         "To: <" + raor() + ">" + toTag,
         "Call-ID: " + st.callId,
         "CSeq: " + cseq + " BYE",
-        st.nonce ? `Proxy-Authorization: ${digest("BYE", "sip:" + domain)}` : null,
+        inviteDigest("BYE"),
         "Content-Length: 0", "", "",
       ].filter(Boolean).join("\r\n");
     };
@@ -395,6 +412,8 @@ function sipCallOnce(o) {
         if (code === 401 || code === 407) {
           if (!st.nonce) {
             st.nonce = (txt.match(/nonce="([^"]+)"/) || [])[1] || null;
+            st.qop = (txt.match(/[Qq]op\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
+            st.realm = (txt.match(/[Rr]eal[mM]\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
             if (st.nonce) steps.push("nonce");
           }
           if (!st.nonce) return done(false, line + " (no nonce)");
