@@ -472,41 +472,39 @@ function sipRegisterOnce(o) {
   const pass = String(o.pass || "");
   const authId = String(o.authId || user);
   const ext = String(o.ext || "");
-  const host = String(o.host || "");
+  const domain = String(o.domain || "sip.ringcentral.com").replace(/:\d+$/, "");
+  const proxy = String(o.host || "sip40.ringcentral.com");
   const port = Number(o.port || 5096);
   const proto = o.proto === "tcp" ? "tcp" : "tls";
   return new Promise((resolve) => {
-    const HOST = host || (proto === "tls" ? "sip.ringcentral.com:5096" : "sip.ringcentral.com");
-    const aorUser = user;
-    const aor = `sip:${aorUser}@${HOST}`;
-    const viaHost = host || (proto === "tls" ? "sip.ringcentral.com:5096" : "sip.ringcentral.com");
+    const aor = `sip:${user}@${domain}`;
+    const contact = `sip:${user}@${proxy}`;
     const steps = [];
     let nonce = null, qop = null, authed = false, realm = null, challenge = "";
     const authUser = authId || user;
     const buildMsg = (cseq) => {
       const lines = [
         "REGISTER " + aor + " SIP/2.0",
-        `Via: SIP/2.0/${proto.toUpperCase()} ${viaHost};branch=z9hG4bK` + crypto.randomBytes(6).toString("hex"),
+        `Via: SIP/2.0/${proto.toUpperCase()} ${proxy};branch=z9hG4bK` + crypto.randomBytes(6).toString("hex"),
         "Max-Forwards: 70",
-        "From: <" + aor + ">;tag=" + crypto.randomBytes(6).toString("hex"),
-        "To: <" + aor + ">",
+        "From: <" + contact + ">;tag=" + crypto.randomBytes(6).toString("hex"),
+        "To: <" + contact + ">",
         "Call-ID: " + crypto.randomBytes(8).toString("hex"),
         "CSeq: " + cseq + " REGISTER",
-        "Contact: <" + aor + ">",
+        "Contact: <" + contact + ">",
         "Expires: 300",
         "User-Agent: MagicDialer-SIP/0.1",
       ];
       if (authed && nonce) {
-        const rlm = realm || HOST;
-        const HA1 = md5(`${authUser}:${rlm}:${pass}`);
+        const HA1 = md5(`${authUser}:${domain}:${pass}`);
         let resp;
         if (qop) {
           const nc = "00000001", cn = crypto.randomBytes(4).toString("hex");
           resp = md5(`${HA1}:${nonce}:${nc}:${cn}:${qop}:${md5("REGISTER:" + aor)}`);
-          lines.push(`Authorization: Digest username="${authUser}", realm="${rlm}", nonce="${nonce}", uri="${aor}", qop=${qop}, nc=${nc}, cnonce="${cn}", response="${resp}"`);
+          lines.push(`Authorization: Digest username="${authUser}", realm="${realm || domain}", nonce="${nonce}", uri="${aor}", qop=${qop}, nc=${nc}, cnonce="${cn}", response="${resp}"`);
         } else {
           resp = md5(`${HA1}:${nonce}:${md5("REGISTER:" + aor)}`);
-          lines.push(`Authorization: Digest username="${authUser}", realm="${rlm}", nonce="${nonce}", uri="${aor}", response="${resp}"`);
+          lines.push(`Authorization: Digest username="${authUser}", realm="${realm || domain}", nonce="${nonce}", uri="${aor}", response="${resp}"`);
         }
       }
       lines.push("Content-Length: 0", "", "");
@@ -518,12 +516,12 @@ function sipRegisterOnce(o) {
       settled = true;
       clearTimeout(hardGate);
       try { sock.destroy(); } catch {}
-      resolve({ ok, host: viaHost, port, proto, user, authId: authUser, ext, steps, pass: "(hidden)", last: line, extra });
+      resolve({ ok, host: proxy, port, proto, user, authId: authUser, ext, domain, steps, pass: "(hidden)", last: line, extra });
     };
     const onConn = () => sock.write(buildMsg(1));
     const sock = proto === "tls"
-      ? tls.connect({ port, host: viaHost, servername: viaHost.split(":")[0], rejectUnauthorized: false }, onConn)
-      : net.connect(port, viaHost, onConn);
+      ? tls.connect({ port, host: proxy, servername: proxy.split(":")[0], rejectUnauthorized: false }, onConn)
+      : net.connect(port, proxy, onConn);
     const hardGate = setTimeout(() => done(false, "no response (network or firewall)"), 11000);
     sock.setTimeout(8000);
     let buf = "";

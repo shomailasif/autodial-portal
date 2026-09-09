@@ -252,13 +252,14 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const a = String(body.authId || "");
       const h = String(body.host || "sip40.ringcentral.com");
       const pt = Number(body.port || 5096);
+      const dm = String(body.domain || "sip.ringcentral.com");
       if (!u || !p) return send(400, { error: "username and password required" });
-      const r1 = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a || u, host: h, port: pt, proto: "tls" });
-      const out = { host: h, port: pt, tls: r1 };
+      const r1 = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a, host: h, port: pt, domain: dm, proto: "tls" });
+      const out = { host: h, port: pt, domain: dm, tls: r1 };
       if (!r1.ok) {
-        const r2 = await trunk.sipRegisterOnce({ user: a || u, pass: p, ext: e, authId: u, host: h, port: pt, proto: "tls" });
+        const r2 = await trunk.sipRegisterOnce({ user: a || u, pass: p, ext: e, authId: u, host: h, port: pt, domain: dm, proto: "tls" });
         out.tls2 = r2;
-        if (!r2.ok) out.tcp = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a || u, host: h, port: 5096, proto: "tcp" });
+        if (!r2.ok) out.tcp = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a || u, host: h, port: 5096, domain: dm, proto: "tcp" });
       }
       return send(200, out);
     }
