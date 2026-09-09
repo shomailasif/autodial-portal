@@ -491,7 +491,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
   media.install(server, { getSession: (id) => trunk.getSession(gatewayCtx.portalId, id) });
 
   server.listen(port, () => {
-    console.log(`[magic-dialer] Platform portal running at http://localhost:${port}`);
+    console.log(`[magic-dialer] Platform portal running (build y2026.09b) at http://localhost:${port}`);
     startLearningLoop(db);
   });
   return server;
