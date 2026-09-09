@@ -277,7 +277,15 @@ async function processHeartbeat(db, { token, voipReady }) {
   let learnedScript = null;
   try {
     const learning = require("./learning");
-    if (s.learning) learnedScript = { text: learning.activeScript(Object.assign({}, c, { settings: s })).text };
+    const cust = Object.assign({}, c, { settings: s });
+    if (!s.learning) {
+      s.learning = learning.initState(cust);
+    }
+    const act = learning.activeScript(cust);
+    if (act && act.text) learnedScript = { text: act.text };
+    // Persist the (possibly repaired) learning state so every portal instance
+    // sees identical scripts - fixes stay durable across multi-instance runs.
+    if (s.learning) await updateCustomer(db, token, { settings: { learning: s.learning } });
   } catch {}
   if (db.pool) {
     await db.pool.query(
