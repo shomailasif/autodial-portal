@@ -1,4 +1,4 @@
-﻿const http = require("node:http");
+const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById, updateCustomer, setCallList, saveLeads } = require("./db");
@@ -243,8 +243,19 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       if (!batch) return send(404, { error: "No batch" });
       return send(200, { ok: true, batch });
     }
+    if (url.pathname === "/api/dev/sipcheck" && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Admin login required" });
+      const body = await readBody(req);
+      const u = String(body.username || "").replace(/[^0-9+]/g, "");
+      const p = String(body.password || "");
+      const e = String(body.extension || "101");
+      if (!u || !p) return send(400, { error: "username and password required" });
+      const r1 = await trunk.sipRegisterOnce(u, p, e, "tcp");
+      const out = { host: "sip.ringcentral.com", tcp: r1 };
+      if (!r1.ok) out.tls = await trunk.sipRegisterOnce(u, p, e, "tls");
+      return send(200, out);
+    }
     if (mTwSt && (method === "POST" || method === "GET")) {
-      const body = method === "POST" ? await readBody(req) : url.searchParams;
       const sid = String(body.CallSid || body.CallSid || "");
       const st = String(body.CallStatus || body.Status || "");
       if (sid) trunk.twilioWebhook(gatewayCtx.portalId, sid, st);

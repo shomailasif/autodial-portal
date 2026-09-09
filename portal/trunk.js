@@ -13,6 +13,8 @@
  *                     registration bridge lands.
  */
 const crypto = require("node:crypto");
+const net = require("node:net");
+const tls = require("node:tls");
 
 // Hosted provider -> default SIP registration domain (used by the cloud to
 // register the trunk later, and by driver selection today).
@@ -462,6 +464,72 @@ function getBatch(token) {
   return b ? batchSummary(b) : null;
 }
 
+/* Dev diagnostic: does an account's credentials register as a SIP soft-phone
+ * from THIS host? Used to prove unattended-call capability on a provider. */
+const md5 = (s) => crypto.createHash("md5").update(s, "ascii").digest("hex");
+function sipRegisterOnce(user, pass, ext, proto) {
+  return new Promise((resolve) => {
+    const HOST = "sip.ringcentral.com";
+    const PORT = proto === "tls" ? 5061 : 5060;
+    const aor = `sip:${user}@${HOST}`;
+    const steps = [];
+    let nonce = null, qop = null, authed = false;
+    const buildMsg = (cseq) => {
+      const lines = [
+        "REGISTER " + aor + " SIP/2.0",
+        `Via: SIP/2.0/${proto.toUpperCase()} 0.0.0.0:0;branch=z9hG4bK` + crypto.randomBytes(6).toString("hex"),
+        "Max-Forwards: 70",
+        "From: <" + aor + ">;tag=" + crypto.randomBytes(6).toString("hex"),
+        "To: <" + aor + ">",
+        "Call-ID: " + crypto.randomBytes(8).toString("hex"),
+        "CSeq: " + cseq + " REGISTER",
+        "Contact: <" + aor + ">",
+        "Expires: 300",
+        "User-Agent: MagicDialer-SIP/0.1",
+      ];
+      if (authed && nonce) {
+        const HA1 = md5(`${user}:${HOST}:${pass}`);
+        let resp;
+        if (qop) {
+          const nc = "00000001", cn = crypto.randomBytes(4).toString("hex");
+          resp = md5(`${HA1}:${nonce}:${nc}:${cn}:${qop}:${md5("REGISTER:" + aor)}`);
+          lines.push(`Authorization: Digest username="${user}", realm="${HOST}", nonce="${nonce}", uri="${aor}", qop=${qop}, nc=${nc}, cnonce="${cn}", response="${resp}"`);
+        } else {
+          resp = md5(`${HA1}:${nonce}:${md5("REGISTER:" + aor)}`);
+          lines.push(`Authorization: Digest username="${user}", realm="${HOST}", nonce="${nonce}", uri="${aor}", response="${resp}"`);
+        }
+      }
+      lines.push("Content-Length: 0", "", "");
+      return lines.join("\r\n");
+    };
+    const done = (ok, line) => {
+      try { sock.destroy(); } catch {}
+      resolve({ ok, steps, user, pass: "(hidden)", ext, proto, last: line });
+    };
+    const sock = proto === "tls"
+      ? tls.connect({ port: PORT, host: HOST, rejectUnauthorized: false }, () => sock.write(buildMsg(1)))
+      : net.connect(PORT, HOST, () => sock.write(buildMsg(1)));
+    sock.setTimeout(9000);
+    let buf = "";
+    sock.on("data", (d) => {
+      buf += d.toString("ascii");
+      if (!buf.includes("\r\n\r\n")) return;
+      const txt = buf; buf = "";
+      const line = txt.split("\r\n")[0].trim();
+      steps.push(line);
+      if (/401|407/.test(line) && !authed) {
+        authed = true;
+        nonce = (txt.match(/[Nn]once="([^"]+)"/) || [])[1] || null;
+        qop = (txt.match(/[Qq]op="([^"]*)"/) || [])[1] || null;
+        setTimeout(() => sock.write(buildMsg(2)), 200);
+      } else if (/200 OK/.test(line)) done(true, line);
+      else if (/^(403|404|484|401)/.test(line)) done(false, line);
+    });
+    sock.on("timeout", () => done(false, "no response (network or firewall)"));
+    sock.on("error", (e) => done(false, "connection error: " + e.message));
+  });
+}
+
 module.exports = {
   HOSTED_VOIP_SERVERS,
   voipComplete,
@@ -471,6 +539,7 @@ module.exports = {
   killSessionsFor,
   hangUp,
   twilioWebhook,
+  sipRegisterOnce,
   startBatch,
   stopBatch,
   getBatch,
