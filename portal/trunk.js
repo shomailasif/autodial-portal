@@ -219,7 +219,7 @@ async function dialViaRingCentral(ctx, session, settings) {
     session.providerLabel = "RingCentral SIP (TLS+SRTP)";
     session.provider = "ringcentral-sip";
     const talkMs = Math.max(2000, 1000 * Number(settings.speakSeconds || 20));
-    sipCallOnce({
+    const opts = {
       user,
       pass: sipPass,
       authId: String(settings.authId || user).trim(),
@@ -229,22 +229,36 @@ async function dialViaRingCentral(ctx, session, settings) {
       number: session.destination,
       durationMs: talkMs,
       codec: settings.codec === "opus" ? "opus" : "pcmu",
-    }).then((r) => {
-      if (!r.ok) {
-        failSession(session, "RingCentral SIP call failed: " + (r.last || "unknown") + (r.steps && r.steps.length ? " [" + r.steps.join(" -> ") + "]" : ""));
-        return;
+    };
+    // SBCs silently drop REGISTERs when the same device registers too
+    // quickly from a fresh port - retry with backoff before giving up.
+    (async () => {
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        if (session.status === "error") return;
+        const r = await sipCallOnce(opts);
+        if (r.ok) {
+          session.status = "connected";
+          session.answeredAt = session.answeredAt || Date.now();
+          session.endedAt = Date.now();
+          session.sip = {
+            steps: r.steps,
+            remoteIp: (r.media || {}).remoteIp,
+            remotePort: (r.media || {}).remotePort,
+            srtp: !!(r.media || {}).remoteKey,
+            inboundAudio: !!(r.media || {}).inboundUnlocked,
+            byes: r.extra || r.last || null,
+          };
+          return;
+        }
+        session.sip = session.sip || { attempts: 0, errors: [] };
+        const s = session.sip;
+        s.attempts++;
+        (s.errors || (s.errors = [])).push(r.last || "unknown");
+        if (attempt < 4) await delay(12000);
       }
-      session.status = "connected";
-      session.answeredAt = session.answeredAt || Date.now();
-      session.endedAt = Date.now();
-      session.sip = {
-        steps: r.steps,
-        remoteIp: (r.media || {}).remoteIp,
-        remotePort: (r.media || {}).remotePort,
-        srtp: !!(r.media || {}).remoteKey,
-        byes: r.extra || r.last || null,
-      };
-    });
+      session.sip = session.sip || { attempts: 0, errors: [] };
+      failSession(session, "RingCentral SIP call failed after " + session.sip.attempts + " attempt(s): " + (session.sip.errors || []).join(" -> ") + (r && r.steps && r.steps.length ? " [" + r.steps.join(" -> ") + "]" : ""));
+    })();
     return session;
   }
 

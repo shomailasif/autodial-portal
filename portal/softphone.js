@@ -476,8 +476,8 @@ function sipCallOnce(o) {
         media.localPort = sock.localPort;
         sock.write(buildRegister(1));
       });
-      const hardGate = setTimeout(() => done(false, "no response (network or firewall)"), 30000);
-      sock.setTimeout(25000);
+      const hardGate = setTimeout(() => done(false, "no response (network or firewall)"), 15000);
+      sock.setTimeout(11000);
       sock.on("data", onData);
       sock.on("timeout", () => done(false, "no response (network or firewall)"));
       sock.on("error", (e) => done(false, "connection error: " + e.message));
