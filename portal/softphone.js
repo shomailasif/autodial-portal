@@ -223,7 +223,7 @@ function sipCallOnce(o) {
       phase: "register", sock: null, fromTag: null, toTag: null,
       callId: null, cseq: 0, registered: false,
     };
-    let media = { ip: null, port: 0, key: null, remoteIp: null, remotePort: null, remoteKey: null, localAddr: null, localPort: null }, status = null, settled = false;
+    let media = { ip: null, port: 0, key: null, remoteIp: null, remotePort: null, remoteKey: null, localAddr: null, localPort: null }, status = null, settled = false, outcome = "failed";
     let udp = null, rtpTimer = null, byeSent = false, acked = false;
     const ssrc = (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) | 0x80000000;
     const regAor = `sip:${user}@${domain}`;
@@ -359,7 +359,7 @@ function sipCallOnce(o) {
       try { clearInterval(rtpTimer); } catch {}
       try { if (udp) udp.close(); } catch {}
       try { if (st.sock) st.sock.destroy(); } catch {}
-      resolve({ ok, status, media, steps, last, extra });
+      resolve({ ok, status, outcome, media, steps, last, extra });
     };
 
     let outSrtp = null, inSrtp = null, rtpCount = 0;
@@ -445,6 +445,7 @@ function sipCallOnce(o) {
         }
         if (st.phase === "invite") {
           status = "answered";
+          outcome = "answered";
           // ACK once (200 to our INVITE)
           if (!acked) { acked = true; st.sock.write(buildAck()); steps.push("ACK"); }
           const body = txt.split("\r\n\r\n").slice(1).join("\r\n\r\n");
@@ -455,13 +456,21 @@ function sipCallOnce(o) {
               inSrtp = new Srtp(sdp.key);
             }
           }
-          // start streaming our PCMU pitch frames
+          // stream the real script payloads (o.payloads = 20ms PCMU frames);
+          // tone fallback only when no audio was supplied.
+          const tones = o.payloads && Array.isArray(o.payloads) && o.payloads.length ? null : pcmuTone(160);
+          const silence = Buffer.alloc(160, 0x7f);
           let seq = crypto.randomBytes(2).readUInt16BE(0);
-          const payload = pcmuTone(160);
           const start = Date.now();
           const sendFrame = () => {
             if (!media.remotePort || settled) return;
             if (!acked) { acked = true; st.sock.write(buildAck()); }
+            let payload;
+            if (tones) payload = tones;
+            else {
+              const idx = Math.floor((Date.now() - start) / 20);
+              payload = idx < o.payloads.length ? o.payloads[idx] : silence;
+            }
             const hdr = rtpHdr(seq, ssrc, seq === 0);
             const pkt = outSrtp.protect(hdr, payload);
             try { udp.send(pkt, 0, pkt.length, media.remotePort, media.remoteIp); } catch {}
@@ -479,6 +488,9 @@ function sipCallOnce(o) {
       }
 
       if (code >= 400 && code < 600) {
+        if (code === 486 || code === 480 || code === 487) outcome = code === 486 ? "busy" : code === 480 ? "no-answer" : "failed";
+        else if (code === 484 || code === 488) outcome = "failed";
+        else outcome = "failed";
         return done(false, line);
       }
     };

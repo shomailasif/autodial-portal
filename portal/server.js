@@ -6,6 +6,8 @@ const { HEARTBEAT_INTERVAL_MS, STALE_AFTER_MS, heartbeatResponse } = require("..
 const { sendEmail, listOutbox } = require("./mailer");
 const { issueSession, verifySession, sessionFromCookieHeader, checkPassword, adminPassword, authenticate, issueCustomerSession, verifyCustomerSession, customerSessionFromCookieHeader } = require("./auth");
 const { searchLeads } = require("./find-leads");
+const learning = require("./learning");
+const audio = require("./audio");
 const trunk = require("./trunk");
 const media = require("./media");
 
@@ -26,7 +28,7 @@ const tenantName = (process.env.PORTAL_NAME || "").trim();
 
 async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, adminPassword } = {}) {
   const db = await openDb(dbPath);
-  const gatewayCtx = { portalId: db.portalId, env: process.env };
+  const gatewayCtx = { portalId: db.portalId, env: process.env, db };
 
   setInterval(() => { markStaleOffline(db, STALE_AFTER_MS + 2000); }, HEARTBEAT_INTERVAL_MS);
 
@@ -240,8 +242,12 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       if (!isAdmin && !myToken) return send(401, { error: "Login required" });
       const token = url.searchParams.get("token") || myToken;
       const batch = trunk.getBatch(token);
-      if (!batch) return send(404, { error: "No batch" });
-      return send(200, { ok: true, batch });
+      if (batch) return send(200, { ok: true, batch, source: "live" });
+      // Cross-instance fallback: last snapshot is persisted on the customer.
+      const c = await getCustomerByToken(db, token);
+      const saved = (c && c.settings && c.settings.batch) || null;
+      if (saved) return send(200, { ok: true, batch: saved, source: "saved" });
+      return send(404, { error: "No batch" });
     }
     if (url.pathname === "/api/dev/sipcheck" && method === "POST") {
       if (!isAdmin && !myToken) return send(401, { error: "Admin login required" });
@@ -297,6 +303,33 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
         },
       });
     }
+    // Dev diagnostic: synthesise the auto-script to frames (proves the portal
+    // can voice the learned script with no external key).
+    if (url.pathname === "/api/dev/tts" && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const b = await readBody(req);
+      const text = String(b.text || "").slice(0, 2000);
+      const frames = text ? await audio.framesFor(text, { ttsKey: b.ttsKey, ttsVoice: b.ttsVoice }) : [];
+      return send(200, {
+        ok: true,
+        text,
+        frames: frames.length,
+        durationMs: frames.length * 20,
+        sampleRate: 8000,
+        bytes: frames.reduce((a, f) => a + f.length, 0),
+      });
+    }
+
+    // Dev diagnostic / admin insight: the learned script + learning state.
+    if (url.pathname === "/api/learn" && method === "GET") {
+      if (!isAdmin) return send(401, { error: "Admin login required" });
+      const token = url.searchParams.get("token");
+      const c = token ? await getCustomerByToken(db, token) : null;
+      if (!c) return send(404, { error: "Customer not found" });
+      const s = (c.settings || {}).learning || learning.initState(c);
+      return send(200, { script: learning.activeScript(c).text, state: { activeVariant: s.activeVariant, stats: s.stats, knowledge: (s.knowledge || []).length, variants: (s.variants || []).map((v) => ({ id: v.id, played: v.played, connected: v.connected, goodLeads: v.goodLeads, scoreSum: v.scoreSum, scoreN: v.scoreN, worked: (v.worked || []).length })) } });
+    }
+
     if (mTwSt && (method === "POST" || method === "GET")) {
       const sid = String(body.CallSid || body.CallSid || "");
       const st = String(body.CallStatus || body.Status || "");
@@ -346,20 +379,46 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
     // --- Record a completed AI call (agent posts this; no login) ---
     if (url.pathname === "/api/call-result" && method === "POST") {
       const body = await readBody(req);
+      const owner = await getCustomerByToken(db, body.token);
+      const score = Number(body.score);
+      const goodLead = !!body.goodLead;
+
+      // Feed the never-ending learning engine with this outcome.
+      let learned = null;
+      if (owner) {
+        const ls = await learning.learnFromCall((owner.settings || {}).learning, { score, goodLead, transcript: body.transcript, connected: true });
+        await updateCustomer(db, owner.token, { settings: { learning: ls } });
+        learned = ls;
+      }
+
       await logCall(db, {
         customerToken: body.token || null,
         product: body.product,
         transcript: body.transcript,
-        score: body.score,
-        goodLead: !!body.goodLead,
+        score,
+        goodLead,
         escalateToHuman: !!body.escalateToHuman,
         strategies: Array.isArray(body.strategies) ? body.strategies : [],
         summary: body.summary,
       });
 
+      // Qualification gate: a lead is only sent/stored when every required
+      // field is present (the script only asks for those fields).
+      const q = owner ? learning.qualifyLead(owner, body.answers) : { qualified: !goodLead, missing: [] };
+
       let emailResult = null;
-      if (body.goodLead) {
-        const owner = await getCustomerByToken(db, body.token);
+      if (goodLead && q.qualified) {
+        let stored = null;
+        if (owner) {
+          stored = await saveLeads(db, owner.token, [{
+            company: (q.answers && (q.answers.NAME || q.answers.COMPANY || q.answers.Company)) || body.summary || "Lead",
+            title: (body.product || "Your service") + " - qualified lead",
+            source: "call:" + Date.now(),
+            snippet: body.summary || body.transcript || "",
+            score: Number.isFinite(score) ? score : 80,
+            answers: q.answers || null,
+          }]);
+        }
         const to = owner?.contact_email || body.contactEmail;
         if (to) {
           emailResult = await sendEmail({
@@ -369,7 +428,13 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
           });
         }
       }
-      return send(200, { ok: true, emailed: emailResult });
+      return send(200, {
+        ok: true,
+        learned: !!learned,
+        qualified: q.qualified,
+        missing: q.missing || [],
+        emailed: emailResult,
+      });
     }
 
     // --- Recent calls (admin only) ---
@@ -427,8 +492,30 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
 
   server.listen(port, () => {
     console.log(`[magic-dialer] Platform portal running at http://localhost:${port}`);
+    startLearningLoop(db);
   });
   return server;
+}
+
+// Never-ending sales-skills loop: every 24h refresh internet knowledge and
+// spawn a new script variant for every live dialer, then re-rank the best.
+function startLearningLoop(db) {
+  const run = async () => {
+    try {
+      const cs = await allCustomers(db);
+      for (const c of cs) {
+        try {
+          const voip = (c.settings || {}).voip || {};
+          if (!(voip.username && voip.sipPassword)) continue;
+          const ls = await learning.dailyPass(c, searchLeads);
+          await updateCustomer(db, c.token, { settings: { learning: ls } });
+          console.log(`[learning] ${c.token.slice(0, 6)} generated new skill variant`);
+        } catch {}
+      }
+    } catch {}
+  };
+  run().catch(() => {});
+  setInterval(() => run().catch(() => {}), 24 * 60 * 60 * 1000);
 }
 
 function esc(s) {

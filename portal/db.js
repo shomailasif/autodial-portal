@@ -260,10 +260,25 @@ async function processHeartbeat(db, { token, voipReady }) {
   }
   const c = await getCustomerByToken(db, token);
   if (!c) return { ok: false, disabled: true, reason: "unknown" };
+  try {
+    c.settings = (c.settings && typeof c.settings === "object") ? c.settings : JSON.parse(c.settings || "{}");
+  } catch { c.settings = {}; }
+  c.settings = c.settings && typeof c.settings === "object" ? c.settings : {};
   const now = Date.now();
   const s = c.settings || {};
   const haveVoip = voipComplete(s.voip);
   const vp = (voipReady === true || !!haveVoip) ? 1 : 0;
+  const learnFields = (() => {
+    try {
+      const v = JSON.parse(c.lead_fields || "[]");
+      return Array.isArray(v) ? v : [];
+    } catch { return []; }
+  })();
+  let learnedScript = null;
+  try {
+    const learning = require("./learning");
+    if (s.learning) learnedScript = { text: learning.activeScript(Object.assign({}, c, { settings: s })).text };
+  } catch {}
   if (db.pool) {
     await db.pool.query(
       "UPDATE customers SET last_seen = $1, status = 'online', voip_ready = $2 WHERE token = $3",
@@ -287,10 +302,12 @@ async function processHeartbeat(db, { token, voipReady }) {
       companyName: (c.settings && c.settings.companyName) || null,
       callbackNumber: (c.settings && c.settings.callbackNumber) || null,
       callbackIn: (c.settings && c.settings.callbackIn) || null,
-      callList: c.call_list || [],
+callList: c.call_list || [],
       searchEnabled: !(c.settings && c.settings.searchEnabled === false),
       lang: (c.settings && /^(en|es|fr|de|pt|hi|auto)$/.test(c.settings.lang)) ? c.settings.lang : "en",
       voiceStyle: (c.settings && /^(human|frank|friendly)$/.test(c.settings.voiceStyle)) ? c.settings.voiceStyle : "human",
+      script: learnedScript,
+      speakSeconds: Number(c.settings && (c.settings.speakSeconds || c.settings.voip && c.settings.voip.speakSeconds)) || 20,
     },
   };
 }
@@ -311,7 +328,7 @@ async function updateCustomer(db, token, patch) {
   if (typeof patch.persona === "string") push("persona", patch.persona || null);
   if (patch.settings && typeof patch.settings === "object") {
     const merged = { ...(c.settings || {}) };
-    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled", "lang", "voiceStyle", "voip"]) {
+    for (const k of ["companyName", "callbackNumber", "callbackIn", "searchEnabled", "lang", "voiceStyle", "voip", "learning", "batch", "callRetries", "ttsKey", "ttsVoice", "scriptOverride", "speakSeconds"]) {
       if (k in patch.settings) {
         // Reject invalid language codes so a typo never clobbers a good value.
         if (k === "lang" && !/^(en|es|fr|de|pt|hi|auto)$/.test(String(patch.settings.lang))) continue;

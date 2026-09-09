@@ -13,9 +13,10 @@
  *                     registration bridge lands.
  */
 const crypto = require("node:crypto");
-const net = require("node:net");
-const tls = require("node:tls");
 const { sipCallOnce } = require("./softphone");
+const audio = require("./audio");
+const learning = require("./learning");
+const { updateCustomer } = require("./db");
 
 // Hosted provider -> default SIP registration domain (used by the cloud to
 // register the trunk later, and by driver selection today).
@@ -229,6 +230,7 @@ async function dialViaRingCentral(ctx, session, settings) {
       number: session.destination,
       durationMs: talkMs,
       codec: settings.codec === "opus" ? "opus" : "pcmu",
+      payloads: Array.isArray(session.audioFrames) && session.audioFrames.length ? session.audioFrames : undefined,
     };
     // SBCs silently drop REGISTERs when the same device registers too
     // quickly from a fresh port - retry with backoff before giving up.
@@ -240,6 +242,7 @@ async function dialViaRingCentral(ctx, session, settings) {
           session.status = "connected";
           session.answeredAt = session.answeredAt || Date.now();
           session.endedAt = Date.now();
+          session.outcome = r.outcome || "answered";
           session.sip = {
             steps: r.steps,
             remoteIp: (r.media || {}).remoteIp,
@@ -252,6 +255,7 @@ async function dialViaRingCentral(ctx, session, settings) {
         }
         session.sip = session.sip || { attempts: 0, errors: [] };
         const s = session.sip;
+        s.outcome = r.outcome || "failed";
         s.attempts++;
         (s.errors || (s.errors = [])).push(r.last || "unknown");
         if (attempt < 6) await delay(3000);
@@ -382,6 +386,21 @@ async function placeCall(ctx, { customer, destination }) {
   CALL_SESSIONS.set(sessionKey(ctx.portalId, id), session);
   session.script = customer.persona || customer.product || null;
 
+  // Auto-generated, never-ending script (nobody types one). Voices it for the
+  // SIP path; the desktop agent receives the same text via heartbeat config.
+  try {
+    const lScript = learning.activeScript(customer);
+    session.variantId = lScript.id;
+    session.script = String((customer.settings || {}).scriptOverride || lScript.text || session.script || "");
+  } catch {
+    session.variantId = null;
+  }
+  if (settings.username && settings.sipPassword) {
+    try {
+      session.audioFrames = await audio.framesFor(session.script || "", { ttsKey: settings.ttsKey, ttsVoice: settings.ttsVoice });
+    } catch { session.audioFrames = []; }
+  }
+
   const drivers = {
     sim: () => dialViaSim(ctx, session),
     ringcentral: () => dialViaRingCentral(ctx, session, settings),
@@ -461,37 +480,63 @@ async function startBatch(ctx, customer, numbers) {
 }
 
 async function batchPump(ctx, batch, list) {
+  const retries = Math.max(0, Math.min(5, Number((batch.customer.settings || {}).callRetries || 2) || 2));
   for (let i = 0; i < list.length; i++) {
     if (batch.stopRequested) break;
     batch.cursor = i;
     const dest = list[i];
-    let s;
-    try {
-      s = await placeCall(ctx, { customer: batch.customer, destination: dest });
-    } catch (e) {
-      batch.results.push({ number: dest, status: "error", error: e.message, at: Date.now() });
-      continue;
-    }
-    batch.current = { id: s.id, number: dest, status: s.status };
-    batch.currentSession = s;
-    if (s.status === "error") {
-      batch.results.push({ number: dest, status: "error", error: s.error, at: Date.now() });
+    let outcome = "failed";
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (batch.stopRequested) break;
+      let s = null;
+      try {
+        s = await placeCall(ctx, { customer: batch.customer, destination: dest });
+      } catch (e) {
+        outcome = "error";
+        if (attempt < retries) { await delay(5000 * (attempt + 1)); continue; }
+        batch.results.push({ number: dest, status: "error", error: e.message, at: Date.now() });
+        outcome = "error";
+        break;
+      }
+      batch.current = { id: s.id, number: dest, status: s.status };
+      batch.currentSession = s;
+      const timeoutMs = 1000 * 60 * (s.provider === "sim" ? 1 : 25);
+      await waitForFinal(timeoutMs, s);
+      const ok = s.status === "connected" || s.status === "completed" || s.status === "in_call";
+      if (ok) {
+        outcome = s.outcome || "connected";
+        batch.results.push({ number: dest, status: "connected", outcome, error: null, at: Date.now() });
+        batch.current = null;
+        batch.currentSession = null;
+        break;
+      }
+      const o = String(s.outcome || (s.sip && s.sip.outcome) || "").toLowerCase();
+      outcome = o === "busy" || o === "no-answer" ? o : "failed";
+      const retryable = outcome !== "no-answer" && outcome !== "busy";
+      if (attempt < retries && retryable) {
+        await delay(5000 * (attempt + 1));
+        continue;
+      }
+      batch.results.push({ number: dest, status: outcome, error: ok ? null : s.error, at: Date.now() });
       batch.current = null;
       batch.currentSession = null;
-      await delay(800);
-      continue;
+      break;
     }
-    const timeoutMs = 1000 * 60 * (s.provider === "sim" ? 1 : 25);
-    await waitForFinal(timeoutMs, s);
-    const ok = s.status === "connected" || s.status === "completed" || s.status === "in_call";
-    batch.results.push({ number: dest, status: ok ? "connected" : s.status, error: ok ? null : s.error, at: Date.now() });
-    batch.current = null;
-    batch.currentSession = null;
+    try { persistBatch(ctx, batch); } catch {}
     await delay(800);
   }
   batch.running = false;
   batch.endedAt = Date.now();
+  try { persistBatch(ctx, batch); } catch {}
   return batchSummary(batch);
+}
+
+/** Persist the latest batch snapshot on the customer so /status works from
+ *  any portal instance (cloud runs are multi-instance). */
+async function persistBatch(ctx, batch) {
+  const db = ctx.db;
+  if (!db || !batch || !batch.customer) return;
+  await updateCustomer(db, batch.customer.token, { settings: { batch: batchSummary(batch) } });
 }
 
 async function waitForFinal(timeoutMs, session) {
