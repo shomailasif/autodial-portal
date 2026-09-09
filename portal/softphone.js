@@ -223,7 +223,7 @@ function sipCallOnce(o) {
       phase: "register", sock: null, fromTag: null, toTag: null,
       callId: null, cseq: 0, registered: false,
     };
-    let media = null, status = null, settled = false;
+    let media = { ip: null, port: 0, key: null, remoteIp: null, remotePort: null, remoteKey: null, localAddr: null, localPort: null }, status = null, settled = false;
     let udp = null, rtpTimer = null, byeSent = false, acked = false;
     const ssrc = (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) | 0x80000000;
     const regAor = `sip:${user}@${domain}`;
@@ -362,146 +362,256 @@ function sipCallOnce(o) {
       resolve({ ok, status, media, steps, last, extra });
     };
 
-    // ---------------- media bootstrap ----------------
-    (async () => {
-      try {
-        const ip = await publicIp();
-        media = { ip, port: 0, key: "", remoteIp: null, remotePort: null, remoteKey: null };
-        udp = dgram.createSocket("udp4");
-        await new Promise((res) => udp.bind(0, "0.0.0.0", res));
-        media.port = udp.address().port;
-        media.key = Buffer.concat([crypto.randomBytes(16), crypto.randomBytes(14)]).toString("base64");
-      } catch (e) {
-        return done(false, "media setup failed: " + e.message);
+    let outSrtp = null, inSrtp = null, rtpCount = 0;
+
+    /** Lazily open the RTP socket + fetch public IP, needed only for INVITE. */
+    const ensureMedia = async () => {
+      if (media && media.port) return;
+      const ip = await publicIp();
+      media.ip = ip;
+      if (!media.key) media.key = Buffer.concat([crypto.randomBytes(16), crypto.randomBytes(14)]).toString("base64");
+      udp = dgram.createSocket("udp4");
+      await new Promise((res) => udp.bind(0, "0.0.0.0", res));
+      media.port = udp.address().port;
+      outSrtp = new Srtp(media.key);
+      udp.on("message", (msg) => {
+        rtpCount++;
+        media.lastRtpAt = new Date().toISOString();
+        if (inSrtp && media.remoteIp) {
+          try {
+            const pkt = inSrtp.unprotect(msg);
+            if (pkt) { media.inboundUnlocked = true; media.lastPayloadLen = pkt.payload.length; }
+          } catch {}
+        }
+      });
+    };
+
+    let buf = "";
+    const onData = async (d) => {
+      if (process.env.SIP_DEBUG) console.log("[sip] data(" + d.length + "):", JSON.stringify(d.toString("ascii").slice(0, 180)));
+      buf += d.toString("ascii");
+      if (!buf.includes("\r\n\r\n")) return;
+      const txt = buf;
+      buf = "";
+      const line = txt.split("\r\n")[0].trim();
+      steps.push(line);
+      const code = parseInt(line.split(" ")[1] || "", 10);
+      const toTagM = txt.match(/[Tt]o:\s*<[^>]*>;tag=([^\s;]+)/);
+      if (toTagM) st.toTag = toTagM[1];
+
+      if (code === 100) return;
+
+      if (code === 401 || code === 407) {
+        if (!st.nonce) {
+          st.nonce = (txt.match(/nonce="([^"]+)"/) || [])[1] || null;
+          st.qop = (txt.match(/[Qq]op\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
+          st.realm = (txt.match(/[Rr]eal[mM]\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
+          if (st.nonce) steps.push("nonce");
+        }
+        if (!st.nonce) return done(false, line + " (no nonce)");
+        if (st.phase === "register") st.sock.write(buildRegister(2));
+        else if (st.phase === "invite") st.sock.write(buildInvite(st.cseq));
+        return;
       }
-      const outSrtp = new Srtp(media.key);
-      // inbound decryptor gets its key from the 183 answer
-      let inSrtp = null;
-      let rtpCount = 0;
 
-      if (udp) {
-        udp.on("message", (msg) => {
-          rtpCount++;
-          media.lastRtpAt = new Date().toISOString();
-          if (inSrtp && media.remoteIp) {
-            try {
-              const pkt = inSrtp.unprotect(msg);
-              if (pkt) {
-                media.inboundUnlocked = true;
-                media.lastPayloadLen = pkt.payload.length;
-              }
-            } catch {}
+      if (code === 180 || code === 183) {
+        status = "ringing";
+        if (code === 183) {
+          const body = txt.split("\r\n\r\n").slice(1).join("\r\n\r\n");
+          const sdp = parseSdp(body);
+          if (sdp.ip && sdp.port && sdp.key) {
+            media.remoteIp = sdp.ip;
+            media.remotePort = sdp.port;
+            media.remoteKey = sdp.key;
+            inSrtp = new Srtp(sdp.key);
           }
-        });
+          steps.push(`183 sdp ${sdp.ip || "-"}:${sdp.port || "-"} crypto=${!!sdp.key}`);
+        }
+        return;
       }
 
-      let buf = "";
-      const onData = (d) => {
-        buf += d.toString("ascii");
-        if (!buf.includes("\r\n\r\n")) return;
-        const txt = buf;
-        buf = "";
-        const line = txt.split("\r\n")[0].trim();
-        steps.push(line);
-        const code = parseInt(line.split(" ")[1] || "", 10);
-        const toTagM = txt.match(/[Tt]o:\s*<[^>]*>;tag=([^\s;]+)/);
-        if (toTagM) st.toTag = toTagM[1];
-
-        if (code === 100) return;
-
-        if (code === 401 || code === 407) {
-          if (!st.nonce) {
-            st.nonce = (txt.match(/nonce="([^"]+)"/) || [])[1] || null;
-            st.qop = (txt.match(/[Qq]op\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
-            st.realm = (txt.match(/[Rr]eal[mM]\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
-            if (st.nonce) steps.push("nonce");
-          }
-          if (!st.nonce) return done(false, line + " (no nonce)");
-          if (st.phase === "register") st.sock.write(buildRegister(2));
-          else if (st.phase === "invite") st.sock.write(buildInvite(st.cseq));
+      if (code === 200) {
+        if (st.phase === "register" && !st.registered) {
+          st.registered = true;
+          st.phase = "invite";
+          st.fromTag = crypto.randomUUID();
+          st.callId = crypto.randomBytes(8).toString("hex");
+          st.cseq = 1;
+          if (settled) return;
+          try { await ensureMedia(); } catch (e) { return done(false, "media setup failed: " + e.message); }
+          if (settled) return;
+          st.sock.write(buildInvite(1));
           return;
         }
-
-        if (code === 180 || code === 183) {
-          status = "ringing";
-          if (code === 183) {
-            const body = txt.split("\r\n\r\n").slice(1).join("\r\n\r\n");
+        if (st.phase === "invite") {
+          status = "answered";
+          // ACK once (200 to our INVITE)
+          if (!acked) { acked = true; st.sock.write(buildAck()); steps.push("ACK"); }
+          const body = txt.split("\r\n\r\n").slice(1).join("\r\n\r\n");
+          if (body.includes("a=crypto:1") && !media.remoteKey) {
             const sdp = parseSdp(body);
             if (sdp.ip && sdp.port && sdp.key) {
-              media.remoteIp = sdp.ip;
-              media.remotePort = sdp.port;
-              media.remoteKey = sdp.key;
+              media.remoteIp = sdp.ip; media.remotePort = sdp.port; media.remoteKey = sdp.key;
               inSrtp = new Srtp(sdp.key);
             }
-            steps.push(`183 sdp ${sdp.ip || "-"}:${sdp.port || "-"} crypto=${!!sdp.key}`);
           }
+          // start streaming our PCMU pitch frames
+          let seq = crypto.randomBytes(2).readUInt16BE(0);
+          const payload = pcmuTone(160);
+          const start = Date.now();
+          const sendFrame = () => {
+            if (!media.remotePort || settled) return;
+            if (!acked) { acked = true; st.sock.write(buildAck()); }
+            const hdr = rtpHdr(seq, ssrc, seq === 0);
+            const pkt = outSrtp.protect(hdr, payload);
+            try { udp.send(pkt, 0, pkt.length, media.remotePort, media.remoteIp); } catch {}
+            seq = (seq + 1) & 0xffff;
+            if (Date.now() - start >= duration) {
+              clearInterval(rtpTimer);
+              st.phase = "bye";
+              if (!byeSent) { byeSent = true; st.sock.write(buildBye()); steps.push("BYE"); }
+              setTimeout(() => done(true, "answered, streamed " + duration + "ms"), 600);
+            }
+          };
+          rtpTimer = setInterval(sendFrame, 20);
           return;
         }
+      }
 
-        if (code === 200) {
-          if (st.phase === "register" && !st.registered) {
-            st.registered = true;
-            st.phase = "invite";
-            st.fromTag = crypto.randomUUID();
-            st.callId = crypto.randomBytes(8).toString("hex");
-            st.cseq = 1;
-            st.sock.write(buildInvite(1));
-            return;
-          }
-          if (st.phase === "invite") {
-            status = "answered";
-            // ACK once (200 to our INVITE)
-            if (!acked) { acked = true; st.sock.write(buildAck()); steps.push("ACK"); }
-            // if the 200 carried SDP and we have none yet, capture it
-            const body = txt.split("\r\n\r\n").slice(1).join("\r\n\r\n");
-            if (body.includes("a=crypto:1") && !media.remoteKey) {
-              const sdp = parseSdp(body);
-              if (sdp.ip && sdp.port && sdp.key) {
-                media.remoteIp = sdp.ip; media.remotePort = sdp.port; media.remoteKey = sdp.key;
-                inSrtp = new Srtp(sdp.key);
-              }
-            }
-            // start streaming our PCMU pitch frames
-            let seq = crypto.randomBytes(2).readUInt16BE(0);
-            const payload = pcmuTone(160);
-            const start = Date.now();
-            const sendFrame = () => {
-              if (!media.remotePort || settled) return;
-              if (!acked) { acked = true; st.sock.write(buildAck()); }
-              const hdr = rtpHdr(seq, ssrc, seq === 0);
-              const pkt = outSrtp.protect(hdr, payload);
-              try { udp.send(pkt, 0, pkt.length, media.remotePort, media.remoteIp); } catch {}
-              seq = (seq + 1) & 0xffff;
-              if (Date.now() - start >= duration) {
-                clearInterval(rtpTimer);
-                st.phase = "bye";
-                if (!byeSent) { byeSent = true; st.sock.write(buildBye()); steps.push("BYE"); }
-                setTimeout(() => done(true, "answered, streamed " + duration + "ms"), 600);
-              }
-            };
-            rtpTimer = setInterval(sendFrame, 20);
-            return;
-          }
-        }
+      if (code >= 400 && code < 600) {
+        return done(false, line);
+      }
+    };
 
-        if (code >= 400 && code < 600) {
-          return done(false, line);
-        }
-      };
-
-      const sock = tls.connect({ port, host: proxy, servername: proxy, rejectUnauthorized: false }, () => {
-        st.sock = sock;
-        media.localAddr = sock.localAddress;
-        media.localPort = sock.localPort;
-        sock.write(buildRegister(1));
-      });
-      const hardGate = setTimeout(() => done(false, "no response (network or firewall)"), 15000);
-      sock.setTimeout(11000);
+    // ---------------- REGISTER first via the proven routine (opens the TLS
+    // socket, does the byte-exact challenge->200 OK dance), then hand the
+    // SAME socket over for the INVITE phase so the working session shape is
+    // reused verbatim. Media comes up only after registration succeeds. -----
+    (async () => {
+      let reg;
+      try { reg = await registerSession(o); } catch (e) { return done(false, "register error: " + e.message); }
+      if (settled) return;
+      if (!reg.ok || !reg.sock) return done(false, reg.last);
+      const sock = reg.sock;
+      st.sock = sock;
+      st.nonce = reg.nonce;
+      st.qop = reg.qop || null;
+      st.realm = reg.realm || domain;
+      media.localAddr = sock.localAddress;
+      media.localPort = sock.localPort;
+      try { await ensureMedia(); } catch (e) { return done(false, "media setup failed: " + e.message); }
+      if (settled) return;
+      steps.push(...reg.steps);
+      st.registered = true;
+      st.phase = "invite";
+      st.fromTag = crypto.randomUUID();
+      st.callId = crypto.randomBytes(8).toString("hex");
+      st.cseq = 1;
       sock.on("data", onData);
       sock.on("timeout", () => done(false, "no response (network or firewall)"));
       sock.on("error", (e) => done(false, "connection error: " + e.message));
+      if (process.env.SIP_DEBUG) console.log("[sip] registered; sending INVITE", st.fromTag.slice(0, 8), "media", media.ip + ":" + media.port);
+      const inv = buildInvite(st.cseq);
+      if (process.env.SIP_DEBUG) console.log("[sip] INVITE " + inv.length + " bytes:\n" + inv.replace(/\r\n/g, "\\r\\n\n"));
+      sock.write(inv);
     })();
   });
 }
 
-module.exports = { sipCallOnce, pcmuTone };
+/** The byte-exact, proven REGISTER routine (brute-force verified: 100 Trying,
+ *  401 challenge, 100 Trying, 200 OK). On success hands back the OPEN, clean
+ *  TLS socket so the caller can continue the session (SIP call) on it. */
+function registerSession(o) {
+  return new Promise((resolve) => {
+    const HOST = String(o.proxy || "sip40.ringcentral.com");
+    const PORT = Number(o.port || 5096);
+    const user = String(o.user || "");
+    const pass = String(o.pass || "");
+    const domain = String(o.domain || "sip.ringcentral.com").replace(/:\d+$/, "");
+    const digestUser = String(o.authId || user);
+    const ruri = `sip:${user}@${domain}`;
+    const contact = `sip:${user}@${HOST}`;
+    const steps = [];
+    let nonce = null, qop = null, realm = null, authed = false;
+    const buildMsg = (cseq) => {
+      const lines = [
+        "REGISTER " + ruri + " SIP/2.0",
+        `Via: SIP/2.0/TLS ${HOST};branch=z9hG4bK` + crypto.randomBytes(6).toString("hex"),
+        "Max-Forwards: 70",
+        `From: <${contact}>;tag=` + crypto.randomBytes(6).toString("hex"),
+        `To: <${contact}>`,
+        "Call-ID: " + crypto.randomBytes(8).toString("hex"),
+        "CSeq: " + cseq + " REGISTER",
+        `Contact: <${contact}>`,
+        "Expires: 300",
+        "User-Agent: MagicDialer-SIP/0.1",
+      ];
+      if (authed && nonce) {
+        const HA1 = md5(`${digestUser}:${domain}:${pass}`);
+        let resp;
+        if (qop) {
+          const nc = "00000001", cn = crypto.randomBytes(4).toString("hex");
+          resp = md5(`${HA1}:${nonce}:${nc}:${cn}:${qop}:${md5("REGISTER:" + ruri)}`);
+          lines.push(`Authorization: Digest username="${digestUser}", realm="${realm || domain}", nonce="${nonce}", uri="${ruri}", qop=${qop}, nc=${nc}, cnonce="${cn}", response="${resp}"`);
+        } else {
+          resp = md5(`${HA1}:${nonce}:${md5("REGISTER:" + ruri)}`);
+          lines.push(`Authorization: Digest username="${digestUser}", realm="${realm || domain}", nonce="${nonce}", uri="${ruri}", response="${resp}"`);
+        }
+      }
+      lines.push("Content-Length: 0", "", "");
+      return lines.join("\r\n");
+    };
+    let settled = false;
+    const sock = tls.connect({ port: PORT, host: HOST, servername: HOST, rejectUnauthorized: false }, () => sock.write(buildMsg(1)));
+    const fail = (last) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardGate);
+      sock.setTimeout(0);
+      try { sock.destroy(); } catch {}
+      resolve({ ok: false, steps, last, sock: null });
+    };
+    const succeed = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardGate);
+      sock.setTimeout(0);
+      if (dh) try { sock.removeListener("data", dh); } catch {}
+      resolve({ ok: true, steps, last: "registered", sock, nonce, realm, qop });
+    };
+    const hardGate = setTimeout(() => fail("no response (network or firewall)"), 9000);
+    sock.setTimeout(6000);
+    let buf = "";
+    const dh = (d) => {
+      buf += d.toString("ascii");
+      if (!buf.includes("\r\n\r\n")) return;
+      const txt = buf; buf = "";
+      const line = txt.split("\r\n")[0].trim();
+      steps.push(line);
+      const m = txt.match(/[Rr]eal[mM]\s*=\s*"?([^"\s,]+)"?/);
+      if (m) realm = m[1];
+      const qm = txt.match(/[Qq]op\s*=\s*"?([^"\s,]+)"?/);
+      if (qm) qop = qm[1];
+      if (/401|407/.test(line) && !authed) {
+        authed = true;
+        nonce = (txt.match(/[Nn]once\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
+        if (nonce) setTimeout(() => sock.write(buildMsg(2)), 150);
+        else fail("no nonce");
+      } else if (/200 OK/.test(line)) succeed();
+      else if (/401|407/.test(line) && authed) fail("auth rejected");
+      else if (/^SIP\/2\.0 (403|484)/.test(line)) fail(line);
+    };
+    sock.on("data", dh);
+    sock.on("timeout", () => fail("sock timeout"));
+    sock.on("error", (e) => fail("conn error: " + e.message));
+  });
+}
+
+/** Register-only validation (closes the socket afterwards). */
+async function rawReg(o) {
+  const r = await registerSession(o);
+  if (r.ok && r.sock) { try { r.sock.destroy(); } catch {} }
+  return { ok: r.ok, steps: r.steps, last: r.last };
+}
+
+module.exports = { sipCallOnce, pcmuTone, rawReg, registerSession };

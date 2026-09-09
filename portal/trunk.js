@@ -233,7 +233,7 @@ async function dialViaRingCentral(ctx, session, settings) {
     // SBCs silently drop REGISTERs when the same device registers too
     // quickly from a fresh port - retry with backoff before giving up.
     (async () => {
-      for (let attempt = 1; attempt <= 4; attempt++) {
+      for (let attempt = 1; attempt <= 6; attempt++) {
         if (session.status === "error") return;
         const r = await sipCallOnce(opts);
         if (r.ok) {
@@ -254,7 +254,7 @@ async function dialViaRingCentral(ctx, session, settings) {
         const s = session.sip;
         s.attempts++;
         (s.errors || (s.errors = [])).push(r.last || "unknown");
-        if (attempt < 4) await delay(12000);
+        if (attempt < 6) await delay(3000);
       }
       session.sip = session.sip || { attempts: 0, errors: [] };
       failSession(session, "RingCentral SIP call failed after " + session.sip.attempts + " attempt(s): " + (session.sip.errors || []).join(" -> ") + (r && r.steps && r.steps.length ? " [" + r.steps.join(" -> ") + "]" : ""));
@@ -607,7 +607,7 @@ function sipRegisterOnce(o) {
 
 /** Dev diagnostic: place one full RC SIP call and return the raw result.
  *  Retries a few times to ride through SBC registration cooldowns. */
-async function sipCallRetry(opts, attempts = 3, gapMs = 20000) {
+async function sipCallRetry(opts, attempts = 5, gapMs = 3500) {
   let r = null;
   for (let i = 0; i < attempts; i++) {
     r = await sipCallOnce(opts);
