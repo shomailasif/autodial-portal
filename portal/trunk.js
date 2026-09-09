@@ -86,6 +86,74 @@ async function dialViaSim(ctx, session) {
   return session;
 }
 
+// Twilio driver - Programmable Voice over REST. This is the AUTOMATIC trunk:
+// nobody answers anything; the portal's /twiml/<id> answers the line and plays
+// the pitch. Per-customer keys: settings.appClientId = Account SID,
+// settings.appClientSecret = Auth Token, settings.number = their verified
+// Twilio caller-id number.
+async function dialViaTwilio(ctx, session, settings) {
+  const fet = ctx.fetch || fetch;
+  const sid = String(settings.appClientId || "").trim();
+  const tok = String(settings.appClientSecret || "").trim();
+  const base = String(ctx.baseUrl || ("https://" + (ctx.env.PUBLIC_BASE_URL || "portal.local"))).replace(/\/+$/, "");
+  if (!sid || !tok) {
+    return failSession(session, "Twilio Account SID / Auth Token missing - set them once on the customer's VOIP settings.");
+  }
+  if (!settings.number) {
+    return failSession(session, "Twilio caller-id number missing - set it once on the customer's VOIP settings.");
+  }
+  const from = normalizeNumber(settings.number);
+  const to = session.destination;
+  let resp;
+  try {
+    resp = await fet(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Calls.json`, {
+      method: "POST",
+      headers: { Authorization: "Basic " + Buffer.from(sid + ":" + tok).toString("base64"), "Content-Type": "application/x-www-form-urlencoded" },
+      body: encode({
+        To: to,
+        From: from,
+        Url: `${base}/twiml/${session.id}`,
+        Timeout: "30",
+        StatusCallback: `${base}/api/twilio-status`,
+        StatusCallbackEvent: "initiated ringing answered completed",
+      }),
+    });
+  } catch (e) {
+    return failSession(session, "Twilio call request failed: " + e.message);
+  }
+  if (!resp.ok) {
+    let detail = "";
+    try { detail = (await resp.text()).slice(0, 300); } catch {}
+    return failSession(session, "Twilio rejected call (HTTP " + resp.status + "): " + detail);
+  }
+  const j = await resp.json();
+  session.status = "dialing";
+  session.providerRef = String(j.sid || "");
+  session.twilioSid = String(j.sid || "");
+  session.providerLabel = "Twilio (REST Voice)";
+  return session;
+}
+
+// Twilio status webhook -> a call session's real outcome.
+function twilioWebhook(portalId, sid, status) {
+  let s = null;
+  for (const c of CALL_SESSIONS.values()) {
+    if (c.portalId === portalId && (c.providerRef === sid || c.twilioSid === sid)) { s = c; break; }
+  }
+  if (!s) return null;
+  const st = String(status || "").toLowerCase();
+  if (st === "ringing" || st === "dialing" || st === "initiated") s.status = "dialing";
+  else if (st === "answered") { s.status = "in_call"; s.answeredAt = s.answeredAt || Date.now(); }
+  else if (st === "completed") { s.status = "connected"; s.endedAt = Date.now(); s.error = null; s.twilioOutcome = status; }
+  else {
+    s.status = "error";
+    s.error = "Twilio: " + (status || "ended") + (st === "no-answer" ? " (no answer)" : st === "busy" ? " (busy)" : "");
+    s.endedAt = Date.now();
+    s.twilioOutcome = status;
+  }
+  return s;
+}
+
 // RingCentral driver - RingOut over REST (443). No SIP port on any PC.
 //
 // Two app-credential paths are supported, chosen by what the portal env
@@ -254,10 +322,12 @@ async function placeCall(ctx, { customer, destination }) {
     startedAt: Date.now(),
   };
   CALL_SESSIONS.set(sessionKey(ctx.portalId, id), session);
+  session.script = customer.persona || customer.product || null;
 
   const drivers = {
     sim: () => dialViaSim(ctx, session),
     ringcentral: () => dialViaRingCentral(ctx, session, settings),
+    twilio: () => dialViaTwilio(ctx, session, settings),
   };
   const fn = drivers[settings.provider];
   if (fn) {
@@ -273,7 +343,7 @@ async function placeCall(ctx, { customer, destination }) {
 }
 
 // Drivers considered "live" for hosted providers (sim is a dry-run driver).
-const LIVE_PROVIDERS = new Set(["sim", "ringcentral"]);
+const LIVE_PROVIDERS = new Set(["sim", "ringcentral", "twilio"]);
 
 function hangUp(portalId, id) {
   const s = getSession(portalId, id);
@@ -281,6 +351,115 @@ function hangUp(portalId, id) {
   s.status = "completed";
   s.endedAt = Date.now();
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-dialer batch engine ("upload a list, press START, work for hours, press
+// STOP"). Provider-agnostic: it dials whatever the customer's VOIP line is.
+// ---------------------------------------------------------------------------
+const BATCHES = new Map();
+const TERMINAL = new Set(["connected", "completed", "error", "failed", "canceled", "no-answer", "busy"]);
+
+function batchSummary(b) {
+  return {
+    id: b.id,
+    running: b.running,
+    current: b.current || null,
+    done: b.results.length,
+    total: b.total,
+    results: b.results,
+    startedAt: b.startedAt,
+    endedAt: b.endedAt || null,
+  };
+}
+
+async function startBatch(ctx, customer, numbers) {
+  const list = (Array.isArray(numbers) ? numbers : [])
+    .map((n) => normalizeNumber(String(n || "").trim()))
+    .filter((n) => /^\+?[0-9]{7,15}$/.test(String(n).replace(/\s/g, "")));
+  if (!list.length) throw Object.assign(new Error("No valid numbers to call"), { code: "NO_NUMBERS" });
+  const prev = BATCHES.get(customer.token);
+  if (prev && prev.running) return batchSummary(prev);
+  const batch = {
+    token: customer.token,
+    portalId: ctx.portalId,
+    id: crypto.randomUUID(),
+    running: true,
+    stopRequested: false,
+    cursor: 0,
+    total: list.length,
+    startedAt: Date.now(),
+    results: [],
+    current: null,
+    currentSession: null,
+    customer,
+  };
+  BATCHES.set(customer.token, batch);
+  batchPump(ctx, batch, list).catch(() => {
+    batch.running = false;
+    batch.endedAt = Date.now();
+  });
+  return batchSummary(batch);
+}
+
+async function batchPump(ctx, batch, list) {
+  for (let i = 0; i < list.length; i++) {
+    if (batch.stopRequested) break;
+    batch.cursor = i;
+    const dest = list[i];
+    let s;
+    try {
+      s = await placeCall(ctx, { customer: batch.customer, destination: dest });
+    } catch (e) {
+      batch.results.push({ number: dest, status: "error", error: e.message, at: Date.now() });
+      continue;
+    }
+    batch.current = { id: s.id, number: dest, status: s.status };
+    batch.currentSession = s;
+    if (s.status === "error") {
+      batch.results.push({ number: dest, status: "error", error: s.error, at: Date.now() });
+      batch.current = null;
+      batch.currentSession = null;
+      await delay(800);
+      continue;
+    }
+    const timeoutMs = 1000 * 60 * (s.provider === "sim" ? 1 : 25);
+    await waitForFinal(timeoutMs, s);
+    const ok = s.status === "connected" || s.status === "completed" || s.status === "in_call";
+    batch.results.push({ number: dest, status: ok ? "connected" : s.status, error: ok ? null : s.error, at: Date.now() });
+    batch.current = null;
+    batch.currentSession = null;
+    await delay(800);
+  }
+  batch.running = false;
+  batch.endedAt = Date.now();
+  return batchSummary(batch);
+}
+
+async function waitForFinal(timeoutMs, session) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const st = session.status || "";
+    if (TERMINAL.has(st)) return st;
+    if (st === "in_call" && session.provider === "sim") return st;
+    await delay(3000);
+  }
+  return session.status || "";
+}
+
+function stopBatch(portalId, token) {
+  const b = BATCHES.get(token);
+  if (!b) return null;
+  b.stopRequested = true;
+  if (b.currentSession && b.portalId) hangUp(b.portalId, b.currentSession.id);
+  b.running = false;
+  b.endedAt = Date.now();
+  return batchSummary(b);
+}
+
+function getBatch(token) {
+  const b = BATCHES.get(token);
+  return b ? batchSummary(b) : null;
 }
 
 module.exports = {
@@ -291,4 +470,8 @@ module.exports = {
   getSessionsFor,
   killSessionsFor,
   hangUp,
+  twilioWebhook,
+  startBatch,
+  stopBatch,
+  getBatch,
 };

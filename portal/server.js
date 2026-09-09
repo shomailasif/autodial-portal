@@ -1,4 +1,4 @@
-const http = require("node:http");
+﻿const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const { openDb, registerCustomer, processHeartbeat, setDisabled, markStaleOffline, allCustomers, getCustomerByToken, logCall, allCalls, getCallById, updateCustomer, setCallList, saveLeads } = require("./db");
@@ -191,6 +191,8 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
     // ever needs SIP ports). The customer drops a number on their line.
     const mDialHang = match(url.pathname, /^\/api\/dial\/([^/]+)\/hangup$/);
     const mDialGet = match(url.pathname, /^\/api\/dial\/([^/]+)$/);
+    const baseUrl = (req.socket.encrypted ? "https" : "http") + "://" + (req.headers.host || url.host || "localhost");
+    const dialCtx = Object.assign({}, gatewayCtx, { baseUrl });
     if (url.pathname === "/api/dial" && method === "POST") {
       if (!isAdmin && !myToken) return send(401, { error: "Login required" });
       const body = await readBody(req);
@@ -200,12 +202,61 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const c = await getCustomerByToken(db, token);
       if (!c) return send(404, { error: "Customer not found" });
       try {
-        const s = await trunk.placeCall(gatewayCtx, { customer: c, destination: body.number });
+        const s = await trunk.placeCall(dialCtx, { customer: c, destination: body.number });
         return send(200, { ok: true, id: s.id, status: s.status, provider: s.provider, providerLabel: s.providerLabel, destination: s.destination, mediaPath: s.mediaPath, error: s.error || null });
       } catch (e) {
         const code = e.code === "BAD_NUMBER" || e.code === "NO_DIALER" ? 400 : 500;
         return send(code, { error: e.message });
       }
+    }
+
+    // --- Auto-dialer batch: upload a list, press START, press STOP when done ---
+    const mTwTwi = match(url.pathname, /^\/twiml\/([^/]+)$/);
+    const mTwSt  = match(url.pathname, /^\/api\/twilio-status$/);
+    if (url.pathname === "/api/autocall" && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const body = await readBody(req);
+      const token = (myToken && !isAdmin) ? myToken : (body.token || myToken);
+      if (!token) return send(400, { error: "Missing access token" });
+      if (!isAdmin && token !== myToken) return send(403, { error: "You can only run calls on your own line" });
+      const c = await getCustomerByToken(db, token);
+      if (!c) return send(404, { error: "Customer not found" });
+      try {
+        const batch = await trunk.startBatch(dialCtx, c, body.numbers);
+        return send(200, { ok: true, batch });
+      } catch (e) {
+        return send(e.code === "NO_NUMBERS" ? 400 : 500, { error: e.message });
+      }
+    }
+    if (url.pathname === "/api/autocall/stop" && method === "POST") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const body = await readBody(req);
+      const token = (myToken && !isAdmin) ? myToken : (body.token || myToken);
+      const batch = trunk.stopBatch(gatewayCtx.portalId, token);
+      if (!batch) return send(404, { error: "No batch running" });
+      return send(200, { ok: true, batch });
+    }
+    if (url.pathname === "/api/autocall/status" && method === "GET") {
+      if (!isAdmin && !myToken) return send(401, { error: "Login required" });
+      const token = url.searchParams.get("token") || myToken;
+      const batch = trunk.getBatch(token);
+      if (!batch) return send(404, { error: "No batch" });
+      return send(200, { ok: true, batch });
+    }
+    if (mTwSt && (method === "POST" || method === "GET")) {
+      const body = method === "POST" ? await readBody(req) : url.searchParams;
+      const sid = String(body.CallSid || body.CallSid || "");
+      const st = String(body.CallStatus || body.Status || "");
+      if (sid) trunk.twilioWebhook(gatewayCtx.portalId, sid, st);
+      return send(200, "<Response/>", { "Content-Type": "text/xml; charset=utf-8" });
+    }
+    if (mTwTwi && (method === "POST" || method === "GET")) {
+      const s = trunk.getSession(gatewayCtx.portalId, mTwTwi.token);
+      if (s) { s.status = "in_call"; s.answeredAt = s.answeredAt || Date.now(); }
+      const text = (s && (s.script || s.notes)) || (s && s.destination ? "Hello, this call is from our team." : "Call complete.");
+      const esc = (v) => String(v || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const xml = "<Response><Say voice=\"alice\" language=\"en-US\">" + esc(text.slice(0, 4000)) + "</Say><Hangup/></Response>";
+      return send(200, xml, { "Content-Type": "text/xml; charset=utf-8" });
     }
     if (mDialGet && method === "GET") {
       if (!isAdmin && !myToken) return send(401, { error: "Login required" });
@@ -918,11 +969,11 @@ function dashboardHtml(rows, calls = [], outbox = []) {
           <div><label class="f">Calls back within (e.g. 30 minutes)</label><input id="eCallbackIn" class="inp" value="\${esc(s.callbackIn||'')}"></div>
           <div><label class="f">Agent language</label><select id="eLang" class="inp">
             <option value="en">English</option>
-            <option value="es">Español (Spanish)</option>
-            <option value="fr">Français (French)</option>
+            <option value="es">EspaÃ±ol (Spanish)</option>
+            <option value="fr">FranÃ§ais (French)</option>
             <option value="de">Deutsch (German)</option>
-            <option value="pt">Português (Portuguese)</option>
-            <option value="hi">हिन्दी (Hindi)</option>
+            <option value="pt">PortuguÃªs (Portuguese)</option>
+            <option value="hi">à¤¹à¤¿à¤¨à¥à¤¦à¥€ (Hindi)</option>
             <option value="auto">Auto-detect on first reply</option>
           </select></div>
           <div><label class="f">Agent voice</label><select id="eVStyle" class="inp">
