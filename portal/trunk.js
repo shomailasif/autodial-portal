@@ -481,7 +481,7 @@ function sipRegisterOnce(o) {
     const aor = `sip:${aorUser}@${HOST}`;
     const viaHost = host || (proto === "tls" ? "sip.ringcentral.com:5096" : "sip.ringcentral.com");
     const steps = [];
-    let nonce = null, qop = null, authed = false, realm = null;
+    let nonce = null, qop = null, authed = false, realm = null, challenge = "";
     const authUser = authId || user;
     const buildMsg = (cseq) => {
       const lines = [
@@ -533,14 +533,17 @@ function sipRegisterOnce(o) {
       const txt = buf; buf = "";
       const line = txt.split("\r\n")[0].trim();
       steps.push(line);
-      const m = txt.match(/[Rr]eal[mM]="([^"]+)"/);
+      const m = txt.match(/[Rr]eal[mM]\s*=\s*"?([^"\s,]+)"?/);
       if (m) realm = m[1];
       if (/401|407/.test(line) && !authed) {
         authed = true;
-        nonce = (txt.match(/[Nn]once="([^"]+)"/) || [])[1] || null;
-        qop = (txt.match(/[Qq]op="([^"]*)"/) || [])[1] || null;
-        setTimeout(() => sock.write(buildMsg(2)), 200);
+        nonce = (txt.match(/[Nn]once\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
+        qop = (txt.match(/[Qq]op\s*=\s*"?([^"\s,]+)"?/) || [])[1] || null;
+        challenge = String(txt.match(/WWW-Authenticate[^\r\n]*/i) || txt.match(/Proxy-Authenticate[^\r\n]*/i) || [""])[0];
+        if (nonce) { setTimeout(() => sock.write(buildMsg(2)), 200); }
+        else done(false, line + " (no nonce in challenge)", { challenge });
       } else if (/200 OK/.test(line)) done(true, line);
+      else if (/401|407/.test(line) && authed) done(false, line + " (auth rejected)");
       else if (/^(403|404|484)/.test(line)) done(false, line);
     });
     sock.on("timeout", () => done(false, "no response (network or firewall)"));
