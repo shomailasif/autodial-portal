@@ -60,6 +60,32 @@ function safeText(v) {
   return String(v || "").replace(/["'<>]/g, "").replace(/\s+/g, " ").trim();
 }
 
+/** Strip HTML entities, URLs, mojibake and control/non-ASCII junk so a web
+ *  snippet becomes clean voice text. */
+function cleanBullet(raw) {
+  let t = String(raw || "");
+  t = t.replace(/&#?[a-zA-Z0-9]+;/g, " ");
+  t = t.replace(/https?:\/\/\S+/g, " ");
+  t = t.replace(/[\uFFFD\u0000-\u001F\u007F-\u009F]/g, " ");
+  t = t.replace(/[^\x20-\x7E]/g, " ");
+  return t.replace(/\s+/g, " ").trim();
+}
+
+const NOISE_RE = /(download|watch|episode|gameplay|trailer|game\b|app store|play store|amazon|your order|buy now|official|newsletter|reviews?\b|opening hours|price\$|\b\d{1,2}\/\d{1,2}\/\d{2,4}\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b)/i;
+
+/** Only keep snippets that are topical for the product and read cleanly. */
+function usableBullet(raw, product) {
+  const t = cleanBullet(raw);
+  if (t.length < 20 || t.length > 300) return null;
+  if (NOISE_RE.test(t)) return null;
+  const words = String(product || "").toLowerCase().split(/\s+/)
+    .map((w) => w.replace(/\W/g, ""))
+    .filter((w) => w.length > 3 && !/^(services?|about|with|from|your)$/.test(w));
+  if (words.length && !words.some((w) => t.toLowerCase().includes(w))) return null;
+  const idx = t.indexOf(".", 40);
+  return (idx > 40 ? t.slice(0, idx + 1) : t).slice(0, 220);
+}
+
 function normalizeField(f) {
   return String(f || "").toUpperCase().replace(/["'<>]/g, "").replace(/\s+/g, " ").trim();
 }
@@ -84,6 +110,12 @@ function generateScript(inputs) {
   const knowledge = Array.isArray(inputs.knowledge) ? inputs.knowledge : [];
   const salt = Number(inputs.salt) || 0;
 
+  const claim = (() => {
+    const usable = (knowledge || []).map((k) => k.bullet && usableBullet(k.bullet, product)).filter(Boolean);
+    if (usable.length) return usable[salt % usable.length];
+    return pick(DEFAULT_CLAIMS, salt);
+  })();
+
   const lines = [];
   const greet = persona
     ? `Hello, this is ${persona}${company ? " from " + company : ""}.`
@@ -95,9 +127,6 @@ function generateScript(inputs) {
   if (product) {
     lines.push(`I'm reaching out because we provide ${product}.`);
   }
-  const claim = knowledge.length
-    ? String(knowledge[salt % knowledge.length].bullet || "")
-    : pick(DEFAULT_CLAIMS, salt);
   if (claim) lines.push(claim);
 
   if (fields.length) {
@@ -145,7 +174,10 @@ function activeScript(customer) {
       s.activeVariant = s.variants.reduce((best, v) => (variantScore(v) > variantScore(best) ? v : best)).id;
     }
   }
-  return { id: s.activeVariant, text: (s.variants.find((v) => v.id === s.activeVariant) || s.variants[0]).text, state: s };
+  // Self-healing: never let a polluted web claim replay on a live call.
+  const active = s.variants.find((v) => v.id === s.activeVariant) || s.variants[0];
+  if (active) repairText(active, inputs, s.knowledge);
+  return { id: s.activeVariant, text: active ? active.text : generateScript({ ...inputs, knowledge: s.knowledge, salt: 0 }), state: s };
 }
 
 /** 0-100 quality score for a variant (Thompson-like: favours samples, then
@@ -213,12 +245,12 @@ async function refreshKnowledge(customer, searchLeads) {
     const seen = new Set();
     const bullets = [];
     for (const r of results) {
-      const text = [r.title, r.snippet].filter(Boolean).join(" - ").replace(/\s+/g, " ").trim();
-      if (text.length < 14) continue;
-      const key = text.slice(0, 60);
+      const good = usableBullet([r.title, r.snippet].filter(Boolean).join(" - "), product);
+      if (!good) continue;
+      const key = good.slice(0, 60);
       if (seen.has(key)) continue;
       seen.add(key);
-      bullets.push({ id: crypto.randomUUID().slice(0, 8), bullet: text.slice(0, 220), source: r.source || "", seenAt: Date.now() });
+      bullets.push({ id: crypto.randomUUID().slice(0, 8), bullet: good, source: r.source || "", seenAt: Date.now() });
       if (bullets.length >= 6) break;
     }
     if (bullets.length) {
@@ -229,6 +261,17 @@ async function refreshKnowledge(customer, searchLeads) {
     /* keep previous knowledge */
   }
   return s;
+}
+
+const POLLUTED_RE = /&#\d+|&#x[a-f0-9]+;|\uFFFD|\bdownload\b/i;
+
+/** Repair any stored variant whose baked text got polluted by a bad web
+ *  snippet, so junk never replays and new variants stay clean. */
+function repairText(v, inputs, knowledge) {
+  if (v && typeof v.text === "string" && POLLUTED_RE.test(v.text)) {
+    v.text = generateScript({ ...inputs, knowledge, salt: v.salt || 0 });
+  }
+  return v;
 }
 
 /** One daily improvement pass: refresh web knowledge, spawn one new A/B
@@ -244,6 +287,7 @@ async function dailyPass(customer, searchLeads, now = Date.now()) {
     s.variants = s.variants.slice(-12);
     s.lastVariantAt = now;
   }
+  for (const v of s.variants || []) repairText(v, inputs, s.knowledge);
   const best = s.variants.length
     ? s.variants.reduce((acc, v) => (variantScore(v) > variantScore(acc) ? v : acc))
     : null;
