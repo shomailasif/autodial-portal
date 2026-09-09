@@ -249,27 +249,14 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const u = String(body.username || "").replace(/[^0-9+]/g, "");
       const p = String(body.password || "");
       const e = String(body.extension || "101");
+      const a = String(body.authId || "");
+      const h = String(body.host || "sip40.ringcentral.com");
+      const pt = Number(body.port || 5096);
       if (!u || !p) return send(400, { error: "username and password required" });
-      const r1 = await trunk.sipRegisterOnce(u, p, e, "tcp");
-      const out = { host: "sip.ringcentral.com", tcp: r1 };
-      if (!r1.ok) out.tls = await trunk.sipRegisterOnce(u, p, e, "tls");
+      const r1 = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a, host: h, port: pt, proto: "tls" });
+      const out = { host: h, port: pt, tls: r1 };
+      if (!r1.ok) out.tcp = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a, host: h, port: 5096, proto: "tcp" });
       return send(200, out);
-    }
-    if (url.pathname === "/api/dev/rcdevices" && method === "POST") {
-      if (!isAdmin && !myToken) return send(401, { error: "Admin login required" });
-      const body = await readBody(req);
-      const settings = {
-        number: String(body.number || "+14807166685"),
-        extension: String(body.extension || "101"),
-        username: String(body.username || "+14807166685"),
-        sipPassword: String(body.password || ""),
-      };
-      try {
-        const out = await trunk.rcDeviceInfo(dialCtx, settings);
-        return send(200, out);
-      } catch (e) {
-        return send(500, { error: e.message });
-      }
     }
     if (mTwSt && (method === "POST" || method === "GET")) {
       const sid = String(body.CallSid || body.CallSid || "");

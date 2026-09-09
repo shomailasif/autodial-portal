@@ -167,25 +167,6 @@ function twilioWebhook(portalId, sid, status) {
 //   2. RC_CLIENT_ID + RC_CLIENT_SECRET - classic password grant; kept for
 //      accounts where RingCentral still allows it.
 // fetch is injectable via ctx.fetch so tests can verify request shape offlin
-async function rcDeviceInfo(ctx, settings) {
-  const fet = ctx.fetch || fetch;
-  const token = await rcToken(ctx, settings);
-  const list = await fet("https://platform.ringcentral.com/restapi/v1.0/account/~/extension/~/device", { headers: { Authorization: "Bearer " + token, Accept: "application/json" } });
-  if (!list.ok) return { error: "device list HTTP " + list.status };
-  const devices = ((await list.json()).records || []).map((d) => ({ id: d.id, name: d.name || null, type: d.type || null, apiType: d.apiType || null, model: (d.phoneLines || [])[0] && (d.phoneLines[0].emergencyAddress || {}) }));
-  const out = [];
-  for (const d of devices) {
-    let sip = null;
-    try {
-      const r = await fet("https://platform.ringcentral.com/restapi/v1.0/account/~/extension/~/device//sip-info", { headers: { Authorization: "Bearer " + token, Accept: "application/json" } });
-      if (r.ok) sip = await r.json();
-    } catch {}
-    out.push({ id: d.id, name: d.name, type: d.type, apiType: d.apiType, sipInfo: sip ? { domain: sip.domain, outboundProxies: sip.outboundProxies, userName: sip.userName, authorizationId: sip.authorizationId, transport: sip.transport, hasPassword: !!(sip.password) } : null });
-  }
-  return { devices: out };
-}
-
-
 async function rcToken(ctx, settings) {
   const fet = ctx.fetch || fetch;
   // A customer may bring their own RingCentral connection: the keys live on
@@ -486,17 +467,26 @@ function getBatch(token) {
 /* Dev diagnostic: does an account's credentials register as a SIP soft-phone
  * from THIS host? Used to prove unattended-call capability on a provider. */
 const md5 = (s) => crypto.createHash("md5").update(s, "ascii").digest("hex");
-function sipRegisterOnce(user, pass, ext, proto) {
+function sipRegisterOnce(o) {
+  const user = String(o.user || "");
+  const pass = String(o.pass || "");
+  const authId = String(o.authId || user);
+  const ext = String(o.ext || "");
+  const host = String(o.host || "");
+  const port = Number(o.port || 5096);
+  const proto = o.proto === "tcp" ? "tcp" : "tls";
   return new Promise((resolve) => {
-    const HOST = "sip.ringcentral.com";
-    const PORT = proto === "tls" ? 5061 : 5060;
-    const aor = `sip:${user}@${HOST}`;
+    const HOST = host || (proto === "tls" ? "sip.ringcentral.com:5096" : "sip.ringcentral.com");
+    const aorUser = user;
+    const aor = `sip:${aorUser}@${HOST}`;
+    const viaHost = host || (proto === "tls" ? "sip.ringcentral.com:5096" : "sip.ringcentral.com");
     const steps = [];
-    let nonce = null, qop = null, authed = false;
+    let nonce = null, qop = null, authed = false, realm = null;
+    const authUser = authId || user;
     const buildMsg = (cseq) => {
       const lines = [
         "REGISTER " + aor + " SIP/2.0",
-        `Via: SIP/2.0/${proto.toUpperCase()} 0.0.0.0:0;branch=z9hG4bK` + crypto.randomBytes(6).toString("hex"),
+        `Via: SIP/2.0/${proto.toUpperCase()} ${viaHost};branch=z9hG4bK` + crypto.randomBytes(6).toString("hex"),
         "Max-Forwards: 70",
         "From: <" + aor + ">;tag=" + crypto.randomBytes(6).toString("hex"),
         "To: <" + aor + ">",
@@ -507,28 +497,30 @@ function sipRegisterOnce(user, pass, ext, proto) {
         "User-Agent: MagicDialer-SIP/0.1",
       ];
       if (authed && nonce) {
-        const HA1 = md5(`${user}:${HOST}:${pass}`);
+        const rlm = realm || HOST;
+        const HA1 = md5(`${authUser}:${rlm}:${pass}`);
         let resp;
         if (qop) {
           const nc = "00000001", cn = crypto.randomBytes(4).toString("hex");
           resp = md5(`${HA1}:${nonce}:${nc}:${cn}:${qop}:${md5("REGISTER:" + aor)}`);
-          lines.push(`Authorization: Digest username="${user}", realm="${HOST}", nonce="${nonce}", uri="${aor}", qop=${qop}, nc=${nc}, cnonce="${cn}", response="${resp}"`);
+          lines.push(`Authorization: Digest username="${authUser}", realm="${rlm}", nonce="${nonce}", uri="${aor}", qop=${qop}, nc=${nc}, cnonce="${cn}", response="${resp}"`);
         } else {
           resp = md5(`${HA1}:${nonce}:${md5("REGISTER:" + aor)}`);
-          lines.push(`Authorization: Digest username="${user}", realm="${HOST}", nonce="${nonce}", uri="${aor}", response="${resp}"`);
+          lines.push(`Authorization: Digest username="${authUser}", realm="${rlm}", nonce="${nonce}", uri="${aor}", response="${resp}"`);
         }
       }
       lines.push("Content-Length: 0", "", "");
       return lines.join("\r\n");
     };
-    const done = (ok, line) => {
+    const done = (ok, line, extra) => {
       try { sock.destroy(); } catch {}
-      resolve({ ok, steps, user, pass: "(hidden)", ext, proto, last: line });
+      resolve({ ok, host: viaHost, port, proto, user, authId: authUser, ext, steps, pass: "(hidden)", last: line, extra });
     };
+    const onConn = () => sock.write(buildMsg(1));
     const sock = proto === "tls"
-      ? tls.connect({ port: PORT, host: HOST, rejectUnauthorized: false }, () => sock.write(buildMsg(1)))
-      : net.connect(PORT, HOST, () => sock.write(buildMsg(1)));
-    sock.setTimeout(9000);
+      ? tls.connect({ port, host: viaHost, servername: viaHost.split(":")[0], rejectUnauthorized: false }, onConn)
+      : net.connect(port, viaHost, onConn);
+    sock.setTimeout(12000);
     let buf = "";
     sock.on("data", (d) => {
       buf += d.toString("ascii");
@@ -536,13 +528,15 @@ function sipRegisterOnce(user, pass, ext, proto) {
       const txt = buf; buf = "";
       const line = txt.split("\r\n")[0].trim();
       steps.push(line);
+      const m = txt.match(/[Rr]eal[mM]="([^"]+)"/);
+      if (m) realm = m[1];
       if (/401|407/.test(line) && !authed) {
         authed = true;
         nonce = (txt.match(/[Nn]once="([^"]+)"/) || [])[1] || null;
         qop = (txt.match(/[Qq]op="([^"]*)"/) || [])[1] || null;
         setTimeout(() => sock.write(buildMsg(2)), 200);
       } else if (/200 OK/.test(line)) done(true, line);
-      else if (/^(403|404|484|401)/.test(line)) done(false, line);
+      else if (/^(403|404|484)/.test(line)) done(false, line);
     });
     sock.on("timeout", () => done(false, "no response (network or firewall)"));
     sock.on("error", (e) => done(false, "connection error: " + e.message));
@@ -559,7 +553,6 @@ module.exports = {
   hangUp,
   twilioWebhook,
   sipRegisterOnce,
-  rcDeviceInfo,
   startBatch,
   stopBatch,
   getBatch,
