@@ -260,13 +260,14 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const pt = Number(body.port || 5096);
       const dm = String(body.domain || "sip.ringcentral.com");
       if (!u || !p) return send(400, { error: "username and password required" });
+      let out = { host: h, port: pt, domain: dm };
+      try {
+        const sdk = require("./softphone");
+        const sdkResult = await sdk.registerSession({ user: u, pass: p, authId: a || u, proxy: h, port: pt, domain: dm });
+        out.sdk = sdkResult;
+      } catch { out.sdk = { ok: false, last: "sdk register threw" }; }
       const r1 = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a, host: h, port: pt, domain: dm, proto: "tls" });
-      const out = { host: h, port: pt, domain: dm, tls: r1 };
-      if (!r1.ok) {
-        const r2 = await trunk.sipRegisterOnce({ user: a || u, pass: p, ext: e, authId: u, host: h, port: pt, domain: dm, proto: "tls" });
-        out.tls2 = r2;
-        if (!r2.ok) out.tcp = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a || u, host: h, port: 5096, domain: dm, proto: "tcp" });
-      }
+      out.legacy = r1;
       return send(200, out);
     }
     if (url.pathname === "/api/dev/sipcall" && method === "POST") {
