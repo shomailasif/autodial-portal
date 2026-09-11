@@ -228,6 +228,7 @@ async function dialViaRingCentral(ctx, session, settings) {
       proxy: String(settings.host || settings.server || "sip40.ringcentral.com"),
       port: Number(settings.port || 5096),
       number: session.destination,
+      callerId: normalizeNumber(settings.number) || normalizeNumber(user),
       durationMs: talkMs,
       codec: settings.codec === "opus" ? "opus" : "pcmu",
       payloads: Array.isArray(session.audioFrames) && session.audioFrames.length ? session.audioFrames : undefined,

@@ -8,10 +8,14 @@
  * Output: array of Buffer(160) μ-law frames = one 20ms RTP payload each.
  */
 const crypto = require("node:crypto");
+const WS = require("ws");
 
 const RATE = 8000;
 const FRAME = 160;
-const SILENCE = Buffer.alloc(FRAME, 0x7f);
+const SILENCE = Buffer.alloc(FRAME, 0xff);
+
+/** G.711 μ-law segment table (RFC 3551). */
+const ULAW_SEG_END = [0x0ff, 0x1ff, 0x3ff, 0x7ff, 0x0fff, 0x1fff, 0x3fff, 0x7fff];
 
 let decoderMod = null;
 function getDecoder() {
@@ -23,14 +27,20 @@ function getDecoder() {
 
 function ulawEncode(sample) {
   let s = sample | 0;
-  const sign = s < 0 ? 0x80 : 0;
-  if (s < 0) s = -s;
-  if (s > 32635) s = 32635;
-  s += 132;
-  let exp = 1;
-  while (s >>= 1) exp++;
-  let mant = (s >> (exp === 8 ? 6 : exp === 7 ? 5 : exp)) & 0x0f;
-  return sign | ((exp - 1) << 4) | mant;
+  const sign = (s >> 8) & 0x80;
+  if (sign) s = -s;
+  if (s > 32767) s = 32767;
+  s += 0x84;
+  let e = 0;
+  while (e < 8 && s > ULAW_SEG_END[e]) e++;
+  let b;
+  if (e === 8) b = 0x7f;
+  else {
+    const mant = (s >> (e + 3)) & 0x0f;
+    b = (e << 4) | mant;
+  }
+  b |= sign;
+  return b ^ 0xff;
 }
 
 function toUlawFrames(pcm16) {
@@ -95,6 +105,21 @@ function decodeWav(buf) {
   return toMono8k(pcm, fmt.sampleRate, channels);
 }
 
+/** Resample PM16 to 8kHz mono with a box anti-alias filter. */
+function resampleTo8k(mono, sampleRate) {
+  if (!mono || !mono.length || !sampleRate || sampleRate === RATE) return mono;
+  const out = new Float64Array(Math.ceil((mono.length * RATE) / sampleRate));
+  const step = sampleRate / RATE;
+  for (let i = 0; i < out.length; i++) {
+    const start = Math.floor(i * step);
+    const end = Math.min(mono.length, Math.max(start + 1, Math.ceil((i + 1) * step)));
+    let acc = 0;
+    for (let j = start; j < end; j++) acc += mono[j];
+    out[i] = acc / (end - start);
+  }
+  return Int16Array.from(out, (v) => Math.max(-32768, Math.min(32767, Math.round(v))));
+}
+
 /** Decode an MP3 buffer to PCM16 8kHz mono (WASM; returns null on failure). */
 async function decodeMp3(buf) {
   const mod = getDecoder();
@@ -106,6 +131,7 @@ async function decodeMp3(buf) {
     const r = dec.decode(new Uint8Array(buf));
     if (!r || !r.channelData || !r.channelData.length || !r.samplesDecoded) return null;
     const channels = r.channelData.length;
+    const rate = Number(r.sampleRate) || 24000;
     const data = r.channelData.map((c) => Float32Array.from(c));
     const mono = new Float64Array(r.samplesDecoded);
     for (let i = 0; i < mono.length; i++) {
@@ -114,7 +140,8 @@ async function decodeMp3(buf) {
       mono[i] = (acc / channels) * 32767;
     }
     dec.free();
-    return Int16Array.from(mono, (v) => Math.max(-32768, Math.min(32767, Math.round(v))));
+    const pcm = Int16Array.from(mono, (v) => Math.max(-32768, Math.min(32767, Math.round(v))));
+    return resampleTo8k(pcm, rate);
   } catch {
     try { if (dec) dec.free(); } catch {}
     return null;
@@ -130,23 +157,99 @@ async function audioToFrames(buf) {
   return [];
 }
 
-/* ------------------------- no-key TTS providers ------------------------- */
+/* ------------------ Microsoft Edge neural TTS (the only voice) ------------------
+ * Free, keyless, natural and expressive voices via the Edge Read Aloud websocket -
+ * the exact engine Microsoft Edge's "Read Aloud" uses. Female conversational voice
+ * "Ava" (Expressive / Friendly). MP3 audio comes back over the socket and is decoded
+ * to μ-law speech frames below. If the service is ever unreachable the call still
+ * proceeds in silence rather than failing. */
 
-const TTS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
+const EDGE_VOICE = "en-US-AvaNeural";
+const EDGE_ALLOWLIST = /Neural$/;
 
-async function fetchBuf(url, headers = {}) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 15000);
-  try {
-    const res = await fetch(url, { headers: { "User-Agent": TTS_UA, ...headers }, signal: ctrl.signal });
-    if (!res.ok) return null;
-    const b = Buffer.from(await res.arrayBuffer());
-    return b && b.length ? b : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(t);
-  }
+const EDGE_HOST = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
+const EDGE_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+const EDGE_GEC_VERSION = "1-143.0.3650.75";
+const EDGE_WS_HEADERS = {
+  "Pragma": "no-cache",
+  "Cache-Control": "no-cache",
+  "Origin": "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+};
+
+const EDGE_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const EDGE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function edgeDateString() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${EDGE_WEEKDAYS[d.getUTCDay()]} ${EDGE_MONTHS[d.getUTCMonth()]} ${p(d.getUTCDate())} ${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT+0000 (Coordinated Universal Time)`;
+}
+
+function edgeSecMsGec(nowS = Date.now() / 1000) {
+  let ticks = nowS + 11644473600;
+  ticks -= ticks % 300;
+  ticks *= 1e9 / 100;
+  return crypto.createHash("sha256").update(`${Math.floor(ticks)}${EDGE_TOKEN}`, "ascii").digest("hex").toUpperCase();
+}
+
+function edgeMakeId() {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+function edgeClean(text) {
+  return String(text || "")
+    .split("").map((c) => { const code = c.charCodeAt(0); return (code <= 0x08 || (code >= 0x0B && code <= 0x0C) || (code >= 0x0E && code <= 0x1F)) ? " " : c; }).join("")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Synthesise `text` with a Microsoft Edge neural voice, return MP3 Buffer (or null). */
+function edgeTts(text, voice) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => finish(null), 20000);
+    function finish(buf) { if (!done) { done = true; clearTimeout(timer); resolve(buf); } }
+    let ws;
+    try {
+      ws = new WS(
+        `${EDGE_HOST}?TrustedClientToken=${EDGE_TOKEN}&ConnectionId=${edgeMakeId()}&Sec-MS-GEC=${edgeSecMsGec()}&Sec-MS-GEC-Version=${EDGE_GEC_VERSION}`,
+        { headers: { ...EDGE_WS_HEADERS, Cookie: `muid=${crypto.randomBytes(16).toString("hex").toUpperCase()};` }, perMessageDeflate: true }
+      );
+    } catch {
+      finish(null);
+      return;
+    }
+    const chunks = [];
+    const stamp = edgeDateString();
+    ws.on("open", () => {
+      ws.send(`X-Timestamp:${stamp}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`, (err) => {
+        if (err) { finish(null); return; }
+        ws.send(
+          `X-RequestId:${edgeMakeId()}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${stamp}Z\r\nPath:ssml\r\n\r\n` +
+          `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>` +
+          `<voice name='${voice}'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>${edgeClean(text)}</prosody></voice></speak>`,
+          (e2) => { if (e2) finish(null); }
+        );
+      });
+    });
+    ws.on("message", (raw, isBinary) => {
+      if (!isBinary) {
+        if (String(raw).includes("turn.end")) {
+          try { ws.close(); } catch {}
+          finish(Buffer.concat(chunks));
+        }
+        return;
+      }
+      const buf = Buffer.from(raw);
+      try {
+        if (buf.length < 2) return;
+        const hl = buf.readUInt16BE(0);
+        const head = buf.toString("ascii", 2, 2 + hl);
+        if (!head.includes("Path:audio")) return;
+        chunks.push(buf.subarray(2 + hl + 2));
+      } catch { finish(null); }
+    });
+    ws.on("error", () => finish(null));
+  });
 }
 
 function splitForTts(text) {
@@ -161,31 +264,14 @@ function splitForTts(text) {
   return chunks.length ? chunks : [String(text || "Hello").slice(0, 180)];
 }
 
-async function googleTts(chunk) {
-  return await fetchBuf(
-    "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en-US&total=1&idx=0&q=" + encodeURIComponent(chunk)
-  );
-}
-
-async function streamElementsTts(chunk, voice = "Brian") {
-  return await fetchBuf(
-    "https://api.streamelements.com/kappa/v2/speech?voice=" + encodeURIComponent(voice) + "&text=" + encodeURIComponent(chunk)
-  );
-}
-
-/** Synthesise `text` to μ-law frames. Tries providers in order; premium key
- *  (ttsKey) is used when present. Returns [] if every provider is unreachable
- *  (caller still proceeds - the agent path carries the script). */
+/** Synthesise `text` to μ-law frames using the Microsoft voice. */
 async function textToFrames(text, opts = {}) {
   const chunks = splitForTts(text);
+  const voice = EDGE_ALLOWLIST.test(opts.ttsVoice || "") ? opts.ttsVoice : EDGE_VOICE;
   const parts = [];
   for (const chunk of chunks) {
-    const m = await fetchBuf("https://api.voicerss.org/tts?key=" + encodeURIComponent(opts.ttsKey) + "&hl=en-us&v=Brian&c=MP3&f=8khz_8bit_mono&src=" + encodeURIComponent(chunk));
-    if (m) { parts.push(m); continue; }
-    const g = await googleTts(chunk);
-    if (g) { parts.push(g); continue; }
-    const s = await streamElementsTts(chunk, opts.ttsVoice || "Brian");
-    if (s) parts.push(s);
+    const m = await edgeTts(chunk, voice);
+    if (m) parts.push(m);
   }
   if (!parts.length) return [];
   return await audioToFrames(Buffer.concat(parts));

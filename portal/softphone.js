@@ -35,24 +35,33 @@ function publicIp() {
   });
 }
 
+/** G.711 μ-law (RFC 3551). 0xFF = silence, MSB set = positive. */
+const ULAW_SEG_END = [0x0ff, 0x1ff, 0x3ff, 0x7ff, 0x0fff, 0x1fff, 0x3fff, 0x7fff];
+function pcmuEncode(sample) {
+  let s = sample | 0;
+  const sign = (s >> 8) & 0x80;
+  if (sign) s = -s;
+  if (s > 32767) s = 32767;
+  s += 0x84;
+  let e = 0;
+  while (e < 8 && s > ULAW_SEG_END[e]) e++;
+  let b;
+  if (e === 8) b = 0x7f;
+  else {
+    const mant = (s >> (e + 3)) & 0x0f;
+    b = (e << 4) | mant;
+  }
+  b |= sign;
+  return b ^ 0xff;
+}
+
 /** G.711 mu-law bytes for a 440 Hz tone, one 20 ms frame at 8 kHz. */
 function pcmuTone(frame = 160) {
   const out = Buffer.alloc(frame);
   const A = 4000;
   for (let i = 0; i < frame; i++) {
     const v = Math.sin((2 * Math.PI * 440 * i) / 8000) * A;
-    const s = Math.max(-32124, Math.min(32124, v | 0));
-    let mag = ((s >> 8) & 0xff) || 1;
-    let u;
-    if (mag >= 0x80) u = 0;
-    else {
-      let seg = 0;
-      while (mag < 0x40) { mag <<= 2; seg += 1; }
-      seg = 7 - seg;
-      u = ((seg << 4) | ((mag >> 1) & 0x0f) | 0x80) ^ 0xff;
-    }
-    if (s < 0) u = ~u & 0xff;
-    out[i] = u & 0xff;
+    out[i] = pcmuEncode(Math.max(-32124, Math.min(32124, v | 0)));
   }
   return out;
 }
@@ -114,12 +123,12 @@ function srtpEncrypt(payload, ssrc, roc, seq, key, salt) {
   return Buffer.concat([cipher.update(payload), cipher.final()]);
 }
 
-function rtpHdr(seq, ssrc, marker) {
+function rtpHdr(seq, ssrc, marker, ts) {
   const b = Buffer.alloc(12);
   b[0] = 0x80;
   b[1] = (marker ? 0x80 : 0x00) | 0; // PT=0 PCMU
   b.writeUInt16BE(seq, 2);
-  b.writeUInt32BE(Math.floor(Date.now() / 1000) & 0xffffffff, 4);
+  b.writeUInt32BE(ts >>> 0, 4);
   b.writeUInt32BE(ssrc >>> 0, 8);
   return b;
 }
@@ -309,6 +318,12 @@ function sipCallOnce(o) {
         "Content-Type: application/sdp",
         "User-Agent: MagicDialer-SIP/0.1",
       ];
+      const cid = String(o.callerId || "").replace(/[^0-9+]/g, "");
+      if (cid) {
+        h.push(`P-Asserted-Identity: <sip:${cid}@${domain}>`);
+        h.push(`Remote-Party-ID: <sip:${cid}@${domain}>;party=calling;screen=yes;privacy=off`);
+        h.push(`P-Preferred-Identity: <sip:${cid}@${domain}>`);
+      }
       if (st.nonce) h.push(inviteDigest("INVITE"));
       h.push(`Content-Length: ${Buffer.byteLength(sdp)}`, "", sdp);
       return h.join("\r\n");
@@ -459,8 +474,9 @@ function sipCallOnce(o) {
           // stream the real script payloads (o.payloads = 20ms PCMU frames);
           // tone fallback only when no audio was supplied.
           const tones = o.payloads && Array.isArray(o.payloads) && o.payloads.length ? null : pcmuTone(160);
-          const silence = Buffer.alloc(160, 0x7f);
+          const silence = Buffer.alloc(160, 0xff);
           let seq = crypto.randomBytes(2).readUInt16BE(0);
+          let ts = (crypto.randomBytes(4).readUInt32BE(0));
           const start = Date.now();
           const sendFrame = () => {
             if (!media.remotePort || settled) return;
@@ -471,10 +487,11 @@ function sipCallOnce(o) {
               const idx = Math.floor((Date.now() - start) / 20);
               payload = idx < o.payloads.length ? o.payloads[idx] : silence;
             }
-            const hdr = rtpHdr(seq, ssrc, seq === 0);
+            const hdr = rtpHdr(seq, ssrc, seq === 0, ts);
             const pkt = outSrtp.protect(hdr, payload);
             try { udp.send(pkt, 0, pkt.length, media.remotePort, media.remoteIp); } catch {}
             seq = (seq + 1) & 0xffff;
+            ts = (ts + 160) >>> 0;
             if (Date.now() - start >= duration) {
               clearInterval(rtpTimer);
               st.phase = "bye";
