@@ -264,7 +264,10 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const sdkPromise = (async () => {
         try {
           const sdk = require("./softphone");
-          return await sdk.registerSession({ user: u, pass: p, authId: a || u, proxy: h, port: pt, domain: dm });
+          return await Promise.race([
+            sdk.registerSession({ user: u, pass: p, authId: a || u, proxy: h, port: pt, domain: dm }),
+            new Promise((res) => setTimeout(() => res({ ok: false, last: "sdk register timed out" }), 15000)),
+          ]);
         } catch { return { ok: false, last: "sdk register threw" }; }
       })();
       const legacyPromise = trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a, host: h, port: pt, domain: dm, proto: "tls" });

@@ -106,6 +106,15 @@ function sipCallOnce(o) {
     (async () => {
       try {
         softphone = new Softphone(sdkOptions(o));
+        // The SDK's TLS socket is created in the constructor; a failed
+        // connect/read surfaces as an unhandled 'error' event which would
+        // crash the whole portal process. Guard it here.
+        if (softphone.client) {
+          softphone.client.on("error", (e) => {
+            steps.push("tls-error:" + (e && e.message));
+            if (!result.ok && result.last === "failed") fail((e && e.message) || "TLS error", "error");
+          });
+        }
         steps.push("connect:" + softphone.sipInfo.outboundProxy);
         softphone.on("outboundMessage", (m) => {
           const first = String(m).trim().split("\r\n")[0];
@@ -175,6 +184,9 @@ async function registerSession(o) {
   let softphone = null;
   try {
     softphone = new Softphone(sdkOptions(o));
+    if (softphone.client) {
+      softphone.client.on("error", (e) => steps.push("tls-error:" + (e && e.message)));
+    }
     if (o.debug) softphone.enableDebugMode();
     await softphone.register();
     steps.push("registered:" + softphone.sipInfo.username + "@" + softphone.sipInfo.domain + " via " + softphone.sipInfo.outboundProxy);
