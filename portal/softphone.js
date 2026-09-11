@@ -155,6 +155,65 @@ function sipCallOnce(o) {
         };
         result.last = "SIP/2.0 200 OK";
 
+        // ---- Speech units ----
+        // Per-unit μ-law segments (each decoded independently so there are no
+        // MP3 concat breaks inside the stream). If the trunk only handed us a
+        // flat payload, treat it as a single unit.
+        const segs = (Array.isArray(o.segments) && o.segments.length)
+          ? o.segments
+              .map((s) => ({ text: (s && s.text) || "", frames: (s && Array.isArray(s.frames)) ? s.frames : (Array.isArray(s) ? s : toFrames([s])) }))
+              .filter((s) => s.frames.length)
+          : (frames.length ? [{ text: o.script || "", frames }] : []);
+
+        const pktEnergy = (pkt) => {
+          let e = 0;
+          const p = pkt.payload;
+          for (let i = 0; i < p.length; i++) { const d = p[i] ^ 0xff; e += d * d; }
+          return e / Math.max(1, p.length);
+        };
+        const isSpeech = (e) => e > 140;
+
+        let silenceStreamer = null;
+        let speaking = false;
+        const stopCurrent = () => { try { if (silenceStreamer) silenceStreamer.stop(); } catch {} silenceStreamer = null; };
+        const keepAliveSilence = () => {
+          if (callSession.disposed || settled || speaking) return;
+          stopCurrent();
+          silenceStreamer = callSession.streamAudio(Buffer.alloc(300 * 160, 0xff)); // 6 s of silence
+          silenceStreamer.once("finished", () => { if (!callSession.disposed && !settled && !speaking) keepAliveSilence(); });
+        };
+
+        const speak = (buf) =>
+          new Promise((res) => {
+            stopCurrent();
+            speaking = true;
+            const s = callSession.streamAudio(buf);
+            s.once("finished", () => { speaking = false; res(); });
+          });
+
+        // Listen for the far side's reply: wait until they say something that
+        // then goes quiet for a beat (or a hard timeout, so a silent answering
+        // machine still lets the script continue).
+        const listenForReply = (holdMs) =>
+          new Promise((resolve) => {
+            let sawSpeech = false;
+            let lastSpeechAt = 0;
+            let done = false;
+            const finish = (v) => { if (done) return; done = true; try { callSession.off("audioPacket", onAudio); } catch {} clearTimeout(hard); resolve(v); };
+            const hard = setTimeout(() => finish("timeout"), Math.max(2000, holdMs));
+            const onAudio = (pkt) => {
+              const e = pktEnergy(pkt);
+              if (isSpeech(e)) {
+                if (!sawSpeech) { sawSpeech = true; steps.push("heard:reply-speech"); }
+                lastSpeechAt = Date.now();
+                return;
+              }
+              if (sawSpeech && lastSpeechAt && Date.now() - lastSpeechAt > 1200) finish("quiet");
+            };
+            callSession.on("audioPacket", onAudio);
+            callSession.once("disposed", () => finish("disposed"));
+          });
+
         // ---- Wait for the far end before speaking ----
         // RingCentral's SBC drops RTP sent in the first moments after answer
         // (it has to lock onto our media flow first). The reliable signal that
@@ -167,29 +226,35 @@ function sipCallOnce(o) {
           let done = false;
           const finishHeard = (v) => { if (!done) { done = true; clearTimeout(heardTimer); try { callSession.off("audioPacket", onAudio); } catch {} resolveHeard(v); } };
           const heardTimer = setTimeout(() => finishHeard(false), inboundWaitMs);
-          const onAudio = (pkt) => {
-            let energy = 0;
-            const p = pkt.payload;
-            for (let i = 0; i < p.length; i++) { const d = p[i] ^ 0xff; energy += d * d; }
-            if (energy / Math.max(1, p.length) > 140) { heardSpeech = true; finishHeard(true); }
-          };
+          const onAudio = (pkt) => { if (isSpeech(pktEnergy(pkt))) { heardSpeech = true; finishHeard(true); } };
           callSession.on("audioPacket", onAudio);
           callSession.once("disposed", () => finishHeard(false));
         });
         steps.push(heardSpeech ? "heard:inbound-speech" : "heard:timeout");
 
-        // ---- Speak the whole script in one continuous stream ----
-        // One uninterrupted audio pass (no mid-call pauses): clean, natural
-        // cadence. Real turn-taking needs speech-to-text, which would make
-        // pauses land in the right places - without it, mid-call pauses only
-        // broke the flow.
-        if (frames.length) {
-          const audio = Buffer.concat([
-            Buffer.alloc(10 * 160, 0xff), // 200 ms lead so the SBC sees clean silence first
-            Buffer.concat(frames),
-          ]);
-          const greetingStreamer = callSession.streamAudio(audio);
-          greetingStreamer.once("finished", () => steps.push("audio:finished"));
+        // ---- Speak the script, pausing only after questions ----
+        // Natural sales cadence: statements flow; when a line ends in a
+        // question, give the person the floor and wait for their answer (VAD),
+        // then continue. Never plows through the whole script in one go.
+        // A ~1 s lead of silence (50 frames) lets the SBC lock onto our media
+        // flow AFTER the far side has spoken so the first words never drop.
+        if (segs.length) {
+          await speak(Buffer.alloc(50 * 160, 0xff));
+          for (let i = 0; i < segs.length; i++) {
+            if (callSession.disposed || settled) break;
+            steps.push("say:" + (i + 1) + "/" + segs.length);
+            await speak(Buffer.concat(segs[i].frames));
+            steps.push("said:" + (i + 1));
+            const isQ = /\?$/.test(segs[i].text.trim()) && i < segs.length - 1;
+            if (isQ) {
+              keepAliveSilence();
+              const turn = await listenForReply(9000);
+              steps.push("turn:" + (i + 1) + ":" + turn);
+              if (turn === "disposed") break;
+              if (turn === "quiet") keepAliveSilence(); // resume streaming silence
+              await speak(Buffer.alloc(15 * 160, 0xff)); // brief beat of silence after their answer
+            }
+          }
         } else {
           steps.push("audio:none");
         }
@@ -199,19 +264,19 @@ function sipCallOnce(o) {
         // down for lack of media. The call ends when the far side hangs up
         // (disposed) or a generous watchdog fires. We never BYE on a fixed
         // speakSeconds timer - that's what made calls "drop on their own".
-        const holdMs = Math.max(10000, durationMs + 120000);
-        const silence = () => {
-          if (callSession.disposed || settled) return;
-          const s = callSession.streamAudio(Buffer.alloc(300 * 160, 0xff)); // 6 s of silence
-          s.once("finished", () => { if (!callSession.disposed && !settled) setTimeout(silence, 0); });
-        };
-        holdTimer = setTimeout(silence, Math.max(0, (frames.length ? frames.length * 20 + 200 : 0) + 300));
-        watchdog = setTimeout(() => fail("watchdog timeout", "completed"), holdMs);
-        callSession.once("disposed", () => {
-          if (!result.ok) return;
-          steps.push("far-side-disposed");
+        if (callSession.disposed || settled) {
+          if (callSession.disposed) steps.push("far-side-disposed");
           finish();
-        });
+        } else {
+          const holdMs = Math.max(10000, durationMs + 120000);
+          keepAliveSilence();
+          watchdog = setTimeout(() => fail("watchdog timeout", "completed"), holdMs);
+          callSession.once("disposed", () => {
+            if (!result.ok) return;
+            steps.push("far-side-disposed");
+            finish();
+          });
+        }
       } catch (e) {
         const msg = (e && e.message) || String(e);
         result.outcome = msg.toLowerCase().includes("busy") ? "busy" : "error";

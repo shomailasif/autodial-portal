@@ -141,6 +141,26 @@ function trimNoiseTail(pcm, sampleRate) {
   return i < pcm.length ? pcm.slice(0, i + frame) : pcm;
 }
 
+/** Cut the decoder's leading flat garbage (MP3 encoder delay) so every
+ *  separately-decoded TTS unit starts clean - without this, joined units
+ *  click/pop at the join ("breaks in the middle" of a call). Keeps a little
+ *  real leading silence. */
+function trimNoiseHead(pcm, sampleRate) {
+  if (!pcm || !pcm.length) return pcm;
+  const frame = Math.round((sampleRate || RATE) / 100); // 10 ms windows
+  let i = 0;
+  let flat = 0;
+  while (i + frame <= pcm.length) {
+    let mn = pcm[i], mx = pcm[i];
+    for (let j = i; j < i + frame; j++) { const v = pcm[j]; if (v < mn) mn = v; else if (v > mx) mx = v; }
+    if (mx - mn > 32) break; // real signal: stop trimming
+    flat++;
+    i += frame;
+    if (flat > 20) break; // keep max ~200 ms of leading silence
+  }
+  return i > 0 ? pcm.slice(Math.max(0, i - frame)) : pcm;
+}
+
 /** Decode an MP3 buffer to PCM16 8kHz mono (WASM; returns null on failure). */
 async function decodeMp3(buf) {
   const mod = getDecoder();
@@ -162,7 +182,7 @@ async function decodeMp3(buf) {
     }
     dec.free();
     const pcm = Int16Array.from(mono, (v) => Math.max(-32768, Math.min(32767, Math.round(v))));
-    return resampleTo8k(trimNoiseTail(pcm, rate), rate);
+    return resampleTo8k(trimNoiseTail(trimNoiseHead(pcm, rate), rate), rate);
   } catch {
     try { if (dec) dec.free(); } catch {}
     return null;
@@ -312,26 +332,39 @@ async function framesFor(text, opts = {}) {
   return frames;
 }
 
-/** Split a script into speakable units (one per sentence / TTS chunk) so the
- *  caller can pause for the far side between them (turn-taking). */
+/** Split a script into speakable units so the caller can pause for the far
+ *  side between them. Sentences ending in "?" close a unit on their own, so a
+ *  question always gets the floor after it (turn-taking). Remaining sentences
+ *  fill units up to a sane TTS chunk length. */
 function unitize(text) {
   const sentences = String(text || "").split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter((s) => s.length);
   const units = [];
   let cur = "";
   for (const s of sentences) {
-    if ((cur + " " + s).trim().length > 180) { if (cur.trim()) units.push(cur.trim()); cur = s; }
-    else cur = (cur + " " + s).trim();
+    const next = (cur + " " + s).trim();
+    if (/\?$/.test(s)) {
+      if (cur.trim()) units.push(cur.trim());
+      units.push(s);
+      cur = "";
+    } else if (next.length > 180) {
+      if (cur.trim()) units.push(cur.trim());
+      cur = s;
+    } else {
+      cur = next;
+    }
   }
   if (cur.trim()) units.push(cur.trim());
   return units.length ? units : [String(text || "Hello").slice(0, 180)];
 }
 
-/** Render a script into separate μ-law frame groups (one per unit). */
+/** Render a script into separate μ-law frame groups (one per unit), each with
+ *  its original text so the caller can decide where to pause (e.g. after
+ *  questions only) and hand the floor to the far side. */
 async function segmentsFor(text, opts = {}) {
   const segs = [];
   for (const u of unitize(text)) {
     const f = await framesFor(u, opts);
-    if (f && f.length) segs.push(f);
+    if (f && f.length) segs.push({ text: u, frames: f });
   }
   return segs;
 }
