@@ -236,6 +236,8 @@ async function dialViaRingCentral(ctx, session, settings) {
       payloads: Array.isArray(session.audioFrames) && session.audioFrames.length ? session.audioFrames : undefined,
       segments: Array.isArray(session.audioSegments) && session.audioSegments.length ? session.audioSegments : undefined,
       script: session.script || settings.script || "",
+      ttsVoice: String(settings.ttsVoice || ""),
+      ttsKey: String(settings.ttsKey || ""),
       listenAfterGreeting: settings.listen === true || settings.turnTaking === true || settings.listening === true,
     };
     // SBCs silently drop REGISTERs when the same device registers too

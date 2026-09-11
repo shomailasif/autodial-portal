@@ -15,6 +15,8 @@
  * whose encoder/decoder in the SDK are pass-through.
  */
 const Softphone = require("ringcentral-softphone");
+const stt = require("./stt");     // free keyless Whisper language detection (lazy + hard timeouts)
+const audio = require("./audio"); // Edge neural TTS, used to re-voice the script to a detected language
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -33,6 +35,26 @@ function toFrames(payloads) {
   return (Array.isArray(payloads) ? payloads : [])
     .map((f) => (Buffer.isBuffer(f) ? f : Buffer.from(f)))
     .filter((f) => f.length);
+}
+
+/** Convert captured μ-law frames into an 8 kHz mono PCM16 WAV (STT input).
+ *  Returns null when there is too little audio to be meaningful. */
+function ulawFramesToWav(frames) {
+  if (!Array.isArray(frames) || !frames.length) return null;
+  const n = frames.reduce((a, f) => a + (f && f.length ? f.length : 0), 0);
+  if (n < 1600) return null; // < 200 ms of speech is nothing
+  const pcm = Buffer.allocUnsafe(n * 2);
+  let off = 0;
+  for (const f of frames) {
+    if (!f) continue;
+    for (let i = 0; i < f.length; i++) { pcm.writeInt16LE(stt.ulawToLinear(f[i]), off); off += 2; }
+  }
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0, "ascii"); h.writeUInt32LE(36 + pcm.length, 4); h.write("WAVE", 8, "ascii");
+  h.write("fmt ", 12, "ascii"); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(8000, 24); h.writeUInt32LE(16000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+  h.write("data", 36, "ascii"); h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
 }
 
 /** Build the SDK options from the same shape trunk.js passes today. */
@@ -72,7 +94,7 @@ function sipCallOnce(o) {
     const durationMs = Math.max(2000, Number(o.durationMs || 20000));
     const frames = toFrames(o.payloads);
     const steps = [];
-    const result = { ok: false, outcome: "failed", last: "", steps, media: null, extra: null };
+    const result = { ok: false, outcome: "failed", last: "", steps, media: null, stt: null, extra: null };
 
     let softphone = null;
     let callSession = null;
@@ -171,23 +193,78 @@ function sipCallOnce(o) {
           for (let i = 0; i < p.length; i++) { const d = p[i] ^ 0xff; e += d * d; }
           return e / Math.max(1, p.length);
         };
-        // Real speech detector. The μ-law energy of an actual voice syllable is
-        // far higher than line hiss/comfort noise; require a sustained loud
-        // streak (several 20ms packets) before believing the person spoke, so
-        // the call never "starts on its own" because of noise.
-        const SPEECH_THRESH = 400;  // mean squared sample distance (0xFF=silence)
-        const SPEECH_WINDOW = 12;   // packets to look back over
-        const SPEECH_MIN = 6;       // of the last 12 packets must be loud
-        const makeSpeechGate = () => {
-          const hist = [];
-          return (e) => {
-            hist.push(e > SPEECH_THRESH ? 1 : 0);
-            if (hist.length > SPEECH_WINDOW) hist.shift();
-            let loud = 0;
-            for (const v of hist) loud += v;
-            return loud >= SPEECH_MIN;
+        // Voice detector (adaptive, not a magic number).
+        //   - It keeps a running noise floor = 10th percentile of the last
+        //     ~3s of packet energy. Line hiss / comfort noise / room ambient
+        //     become the floor, so a fixed threshold can never be beaten by a
+        //     noisy line - only real speech is much louder than the floor.
+        //   - A packet is "loud" when energy >= max(floor * VOICE_RATIO, ABS_MIN).
+        //   - The person must talk CONTINUOUSLY for VOICE_ONSET packets (a
+        //     click / cough / DTMF blip is too short to open the gate).
+        //   - The utterance only "ends" after a quiet run of VOICE_QUIET
+        //     packets (they finished talking). The call then proceeds - it
+        //     never starts in the middle of someone's sentence. If they never
+        //     talk, the detector simply never opens and the call stays silent.
+        const VOICE_ABS_MIN = 1000; // mean-squared μ-law level; nothing below counts
+        const VOICE_RATIO = 5;      // loud = >= 5x the line's noise floor
+        const VOICE_ONSET = 10;     // ~200ms of continuous loud to believe onset
+        const VOICE_QUIET = 40;     // ~800ms of quiet = their utterance ended
+        const VOICE_MAXTALK = 600;  // if they talk 12s non-stop, end anyway
+        const FLOOR_WIN = 160;      // packets considered for noise floor (~3.2s)
+        function createVoiceDetector() {
+          const seen = [];
+          let loudRun = 0;
+          let quietRun = 0;
+          let talking = false;
+          let talkTime = 0;
+          const floorAt = () => {
+            if (seen.length < 24) return Math.max(200, VOICE_ABS_MIN);
+            const s = seen.slice(0, seen.length).sort((a, b) => a - b);
+            return Math.max(120, s[Math.min(s.length - 1, Math.floor(s.length * 0.1))]);
           };
-        };
+          return {
+            feed(e) {
+              seen.push(e);
+              if (seen.length > FLOOR_WIN) seen.shift();
+              const f = floorAt();
+              const loud = e >= Math.max(f * VOICE_RATIO, VOICE_ABS_MIN);
+              if (!talking) {
+                loudRun = loud ? loudRun + 1 : 0;
+                if (loudRun >= VOICE_ONSET) { talking = true; quietRun = 0; talkTime = 0; return "onset"; }
+                return "idle";
+              }
+              talkTime++;
+              quietRun = loud ? 0 : quietRun + 1;
+              if (quietRun >= VOICE_QUIET) { talking = false; return "done"; }
+              if (talkTime >= VOICE_MAXTALK) { talking = false; return "done"; }
+              return "talking";
+            },
+          };
+        }
+        // Wait for the far side to produce ONE complete utterance. Resolves
+        // { state: "answered", frames } when they talked and fell quiet (never
+        // in the middle of their speech), or { state: "disposed" } if they hang
+        // up. If they never talk we wait as long as it takes - silence is
+        // streamed separately so the call never advances or hangs up while the
+        // listener is quiet. When capture is set, the μ-law frames from voice
+        // onset until they stopped are kept (the caller feeds them to STT).
+        const waitForUtterance = (label, opts = {}) =>
+          new Promise((resolve) => {
+            const det = createVoiceDetector();
+            const utt = [];
+            let collecting = false;
+            let done = false;
+            const finish = (v) => { if (done) return; done = true; try { callSession.off("audioPacket", onAudio); } catch {} resolve({ state: v, frames: opts.capture ? utt.slice() : [] }); };
+            const onAudio = (pkt) => {
+              const e = pktEnergy(pkt);
+              const ev = det.feed(e);
+              if (ev === "onset") { steps.push("heard:" + label + ":voice:e" + Math.round(e)); collecting = true; }
+              if (ev === "done") { collecting = false; return finish("answered"); }
+              if (collecting && pkt && pkt.payload && pkt.payload.length) utt.push(Buffer.from(pkt.payload));
+            };
+            callSession.on("audioPacket", onAudio);
+            callSession.once("disposed", () => finish("disposed"));
+          });
 
         let silenceStreamer = null;
         let speaking = false;
@@ -207,54 +284,15 @@ function sipCallOnce(o) {
             s.once("finished", () => { speaking = false; res(); });
           });
 
-        // Listen for the far side's reply: wait until they say something that
-        // then goes quiet for a beat (or a hard timeout, so a silent answering
-        // machine still lets the script continue).
-        const listenForReply = (holdMs) =>
-          new Promise((resolve) => {
-            let sawSpeech = false;
-            let lastSpeechAt = 0;
-            let done = false;
-            const gate = makeSpeechGate();
-            const finish = (v) => { if (done) return; done = true; try { callSession.off("audioPacket", onAudio); } catch {} clearTimeout(hard); resolve(v); };
-            const hard = setTimeout(() => finish("timeout"), Math.max(2000, holdMs));
-            const onAudio = (pkt) => {
-              const e = pktEnergy(pkt);
-              if (gate(e)) {
-                if (!sawSpeech) { sawSpeech = true; steps.push("heard:reply-speech"); }
-                lastSpeechAt = Date.now();
-                return;
-              }
-              if (sawSpeech && lastSpeechAt && Date.now() - lastSpeechAt > 1200) finish("quiet");
-            };
-            callSession.on("audioPacket", onAudio);
-            callSession.once("disposed", () => finish("disposed"));
-          });
-
-        // ---- Wait for the FAR SIDE TO SPEAK before we say a word ----
-        // The call starts ONLY after the other person says something (their
-        // greeting), never on its own, never on a timer. Listening to their
-        // first words also gives us a chance to infer which language they are
-        // speaking. If the far side never speaks we simply keep the line open
-        // and wait - the call must not talk over a silent listener.
-        const heardSpeech = await new Promise((resolveHeard) => {
-          let done = false;
-          const gate = makeSpeechGate();
-          const finishHeard = (v) => { if (done) return; done = true; try { callSession.off("audioPacket", onAudio); } catch {} resolveHeard(v); };
-          const onAudio = (pkt) => {
-            const e = pktEnergy(pkt);
-            if (gate(e)) {
-              steps.push("heard:far-side-spoken:e" + Math.round(e));
-              finishHeard(true);
-            }
-          };
-          callSession.on("audioPacket", onAudio);
-          callSession.once("disposed", () => finishHeard(false));
-        });
-        if (!heardSpeech) {
-          // The other side answered but never spoke. We do not talk over a
-          // silent listener and we do not hang up on ourselves - just hold the
-          // line until they hang up or finally say something.
+        // ---- Converge on the far side's voice before saying a word ----
+        // The call starts ONLY after the other person has SPOKEN AND FINISHED
+        // their first utterance (greeting). Never on its own, never on a timer.
+        // If the far side never speaks we keep the line open and hold - we do
+        // not talk over a silent listener and we do not hang up on ourselves.
+        // The captured utterance is handed to language detection so the voice
+        // and script match what the listener actually speaks.
+        const first = await waitForUtterance("start", { capture: true });
+        if (first.state !== "answered") {
           steps.push("far-side-never-spoke");
           keepAliveSilence();
           const holdMs = Math.max(10000, durationMs + 120000);
@@ -266,15 +304,51 @@ function sipCallOnce(o) {
           });
         } else {
           steps.push("gate:passed");
+          // ---- Hear their language before we say a word ----
+          // The captured greeting is fed to the in-process Whisper model. The
+          // matching neural voice takes over (LANG_VOICES); if STT cannot load
+          // or times out (first-run download, 256Mi container, no dependency)
+          // we keep the configured voice and the already-rendered script - STT
+          // must never stall or break a live call.
+          let det = null;
+          {
+            const wav = ulawFramesToWav(first.frames);
+            det = wav ? await stt.detectLanguage(wav, { timeoutMs: 25000 }) : null;
+          }
+          let chosenVoice = String(o.ttsVoice || "");
+          if (det && det.lang) {
+            const lang = String(det.lang);
+            chosenVoice = stt.LANG_VOICES[lang] || chosenVoice;
+            const heard = String(det.text || "").slice(0, 80);
+            steps.push("stt:lang=" + lang + (chosenVoice ? ":voice=" + chosenVoice : "") + (heard ? ":hear=" + heard : ""));
+            result.stt = { lang, text: String(det.text || "").slice(0, 200) || null, voice: chosenVoice || null, sourceVoice: o.ttsVoice || null, frames: first.frames.length };
+          } else {
+            steps.push("stt:unavailable:keep=" + (chosenVoice || "default"));
+            result.stt = { lang: null, text: null, voice: chosenVoice || null, sourceVoice: o.ttsVoice || null, frames: first.frames.length };
+          }
+          // Re-voice the script into the detected language when it differs from
+          // the voice the segments were rendered with. Bounded hard: if Edge
+          // TTS is unreachable or too slow, the pre-rendered speech stays.
+          if (chosenVoice && o.ttsVoice && chosenVoice !== o.ttsVoice && segs.length && String(o.script || "").trim()) {
+            const re = await Promise.race([
+              audio.segmentsFor(String(o.script), { ttsVoice: chosenVoice, ttsKey: o.ttsKey })
+                .then((s) => (s && s.length ? s : null))
+                .catch(() => null),
+              new Promise((res) => setTimeout(() => res(null), 20000)),
+            ]);
+            if (re) { segs.splice(0, segs.length, ...re); steps.push("voiced:" + chosenVoice + ":units=" + re.length); }
+            else steps.push("voiced:fallback:" + chosenVoice);
+          }
         }
 
-        // ---- Speak the script, pausing only after questions ----
-        // Natural sales cadence: statements flow; when a line ends in a
-        // question, give the person the floor and wait for their answer (VAD),
-        // then continue. Never plows through the whole script in one go.
-        // A ~1 s lead of silence (50 frames) lets the SBC lock onto our media
-        // flow AFTER the far side has spoken so the first words never drop.
-        if (segs.length) {
+        // ---- Speak the script, pausing ONLY after questions ----
+        // Natural sales cadence: statements flow; after a question the person
+        // gets the floor and we WAIT for their answer (no timeout - a quiet
+        // listener never forces us to plow ahead). We only continue once they
+        // have spoken and finished. A ~1 s lead of silence (50 frames) lets
+        // the SBC lock onto our media AFTER the far side has spoken so the
+        // first words never drop.
+        if (segs.length && !callSession.disposed && !settled) {
           await speak(Buffer.alloc(50 * 160, 0xff));
           for (let i = 0; i < segs.length; i++) {
             if (callSession.disposed || settled) break;
@@ -283,11 +357,10 @@ function sipCallOnce(o) {
             steps.push("said:" + (i + 1));
             const isQ = /\?$/.test(segs[i].text.trim()) && i < segs.length - 1;
             if (isQ) {
-              keepAliveSilence();
-              const turn = await listenForReply(9000);
-              steps.push("turn:" + (i + 1) + ":" + turn);
-              if (turn === "disposed") break;
-              if (turn === "quiet") keepAliveSilence(); // resume streaming silence
+              keepAliveSilence(); // keep the media flow alive while listening
+              const turn = await waitForUtterance("turn" + (i + 1));
+              steps.push("turn:" + (i + 1) + ":" + turn.state);
+              if (turn.state === "disposed") break;
               await speak(Buffer.alloc(15 * 160, 0xff)); // brief beat of silence after their answer
             }
           }
