@@ -261,12 +261,15 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const dm = String(body.domain || "sip.ringcentral.com");
       if (!u || !p) return send(400, { error: "username and password required" });
       let out = { host: h, port: pt, domain: dm };
-      try {
-        const sdk = require("./softphone");
-        const sdkResult = await sdk.registerSession({ user: u, pass: p, authId: a || u, proxy: h, port: pt, domain: dm });
-        out.sdk = sdkResult;
-      } catch { out.sdk = { ok: false, last: "sdk register threw" }; }
-      const r1 = await trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a, host: h, port: pt, domain: dm, proto: "tls" });
+      const sdkPromise = (async () => {
+        try {
+          const sdk = require("./softphone");
+          return await sdk.registerSession({ user: u, pass: p, authId: a || u, proxy: h, port: pt, domain: dm });
+        } catch { return { ok: false, last: "sdk register threw" }; }
+      })();
+      const legacyPromise = trunk.sipRegisterOnce({ user: u, pass: p, ext: e, authId: a, host: h, port: pt, domain: dm, proto: "tls" });
+      const [sdkResult, r1] = await Promise.all([sdkPromise, legacyPromise]);
+      out.sdk = sdkResult;
       out.legacy = r1;
       return send(200, out);
     }
