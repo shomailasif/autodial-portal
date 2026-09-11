@@ -171,7 +171,23 @@ function sipCallOnce(o) {
           for (let i = 0; i < p.length; i++) { const d = p[i] ^ 0xff; e += d * d; }
           return e / Math.max(1, p.length);
         };
-        const isSpeech = (e) => e > 140;
+        // Real speech detector. The μ-law energy of an actual voice syllable is
+        // far higher than line hiss/comfort noise; require a sustained loud
+        // streak (several 20ms packets) before believing the person spoke, so
+        // the call never "starts on its own" because of noise.
+        const SPEECH_THRESH = 400;  // mean squared sample distance (0xFF=silence)
+        const SPEECH_WINDOW = 12;   // packets to look back over
+        const SPEECH_MIN = 6;       // of the last 12 packets must be loud
+        const makeSpeechGate = () => {
+          const hist = [];
+          return (e) => {
+            hist.push(e > SPEECH_THRESH ? 1 : 0);
+            if (hist.length > SPEECH_WINDOW) hist.shift();
+            let loud = 0;
+            for (const v of hist) loud += v;
+            return loud >= SPEECH_MIN;
+          };
+        };
 
         let silenceStreamer = null;
         let speaking = false;
@@ -199,11 +215,12 @@ function sipCallOnce(o) {
             let sawSpeech = false;
             let lastSpeechAt = 0;
             let done = false;
+            const gate = makeSpeechGate();
             const finish = (v) => { if (done) return; done = true; try { callSession.off("audioPacket", onAudio); } catch {} clearTimeout(hard); resolve(v); };
             const hard = setTimeout(() => finish("timeout"), Math.max(2000, holdMs));
             const onAudio = (pkt) => {
               const e = pktEnergy(pkt);
-              if (isSpeech(e)) {
+              if (gate(e)) {
                 if (!sawSpeech) { sawSpeech = true; steps.push("heard:reply-speech"); }
                 lastSpeechAt = Date.now();
                 return;
@@ -214,23 +231,42 @@ function sipCallOnce(o) {
             callSession.once("disposed", () => finish("disposed"));
           });
 
-        // ---- Wait for the far end before speaking ----
-        // RingCentral's SBC drops RTP sent in the first moments after answer
-        // (it has to lock onto our media flow first). The reliable signal that
-        // the path is fully up is inbound audio from the other side. So wait for
-        // the first non-silence audio packet (or a timeout, so a silent
-        // answering machine still gets the greeting), then speak from the top.
-        const inboundWaitMs = 20000;
-        let heardSpeech = false;
-        await new Promise((resolveHeard) => {
+        // ---- Wait for the FAR SIDE TO SPEAK before we say a word ----
+        // The call starts ONLY after the other person says something (their
+        // greeting), never on its own, never on a timer. Listening to their
+        // first words also gives us a chance to infer which language they are
+        // speaking. If the far side never speaks we simply keep the line open
+        // and wait - the call must not talk over a silent listener.
+        const heardSpeech = await new Promise((resolveHeard) => {
           let done = false;
-          const finishHeard = (v) => { if (!done) { done = true; clearTimeout(heardTimer); try { callSession.off("audioPacket", onAudio); } catch {} resolveHeard(v); } };
-          const heardTimer = setTimeout(() => finishHeard(false), inboundWaitMs);
-          const onAudio = (pkt) => { if (isSpeech(pktEnergy(pkt))) { heardSpeech = true; finishHeard(true); } };
+          const gate = makeSpeechGate();
+          const finishHeard = (v) => { if (done) return; done = true; try { callSession.off("audioPacket", onAudio); } catch {} resolveHeard(v); };
+          const onAudio = (pkt) => {
+            const e = pktEnergy(pkt);
+            if (gate(e)) {
+              steps.push("heard:far-side-spoken:e" + Math.round(e));
+              finishHeard(true);
+            }
+          };
           callSession.on("audioPacket", onAudio);
           callSession.once("disposed", () => finishHeard(false));
         });
-        steps.push(heardSpeech ? "heard:inbound-speech" : "heard:timeout");
+        if (!heardSpeech) {
+          // The other side answered but never spoke. We do not talk over a
+          // silent listener and we do not hang up on ourselves - just hold the
+          // line until they hang up or finally say something.
+          steps.push("far-side-never-spoke");
+          keepAliveSilence();
+          const holdMs = Math.max(10000, durationMs + 120000);
+          watchdog = setTimeout(() => fail("watchdog timeout", "completed"), holdMs);
+          callSession.once("disposed", () => {
+            if (!result.ok) return;
+            steps.push("far-side-disposed");
+            finish();
+          });
+        } else {
+          steps.push("gate:passed");
+        }
 
         // ---- Speak the script, pausing only after questions ----
         // Natural sales cadence: statements flow; when a line ends in a
