@@ -156,7 +156,18 @@ function sipCallOnce(o) {
         result.last = "SIP/2.0 200 OK";
 
         if (frames.length) {
-          const audio = Buffer.concat(frames);
+          // The UDP hello punch-through that tells RingCentral where our media
+          // port is takes a moment to be honoured; RTP sent in the first ~1s
+          // after answer is dropped by the SBC before it locks onto our flow.
+          // Pause briefly so the far end is truly ready, and lead with silence
+          // so any stray drop hits padding rather than the first words.
+          const startDelayMs = 900;
+          const silentLeadFrames = 40; // 800 ms of silence at 20 ms/frame
+          await new Promise((r) => setTimeout(r, startDelayMs));
+          const audio = Buffer.concat([
+            Buffer.alloc(silentLeadFrames * 160, 0xff),
+            ...frames,
+          ]);
           // Pad with mu-law silence (0xFF) up to the requested hold time so the
           // SBC keeps receiving continuous RTP until we send BYE.
           const want = Math.floor((durationMs / 20) * 160);
