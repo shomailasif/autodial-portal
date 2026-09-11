@@ -155,29 +155,60 @@ function sipCallOnce(o) {
         };
         result.last = "SIP/2.0 200 OK";
 
+        // ---- Wait for the far end before speaking ----
+        // RingCentral's SBC drops RTP sent in the first moments after answer
+        // (it has to lock onto our media flow first). The reliable signal that
+        // the path is fully up is inbound audio from the other side. So wait for
+        // the first non-silence audio packet (or a timeout, so a silent
+        // answering machine still gets the greeting), then speak from the top.
+        const inboundWaitMs = 20000;
+        let heardSpeech = false;
+        await new Promise((resolveHeard) => {
+          let done = false;
+          const finishHeard = (v) => { if (!done) { done = true; clearTimeout(heardTimer); try { callSession.off("audioPacket", onAudio); } catch {} resolveHeard(v); } };
+          const heardTimer = setTimeout(() => finishHeard(false), inboundWaitMs);
+          const onAudio = (pkt) => {
+            let energy = 0;
+            const p = pkt.payload;
+            for (let i = 0; i < p.length; i++) { const d = p[i] ^ 0xff; energy += d * d; }
+            if (energy / Math.max(1, p.length) > 140) { heardSpeech = true; finishHeard(true); }
+          };
+          callSession.on("audioPacket", onAudio);
+          callSession.once("disposed", () => finishHeard(false));
+        });
+        steps.push(heardSpeech ? "heard:inbound-speech" : "heard:timeout");
+
+        // ---- Speak the greeting ----
+        let greetingStreamer = null;
         if (frames.length) {
-          // The UDP hello punch-through that tells RingCentral where our media
-          // port is takes a moment to be honoured; RTP sent in the first ~1s
-          // after answer is dropped by the SBC before it locks onto our flow.
-          // Pause briefly so the far end is truly ready, and lead with silence
-          // so any stray drop hits padding rather than the first words.
-          const startDelayMs = 900;
-          const silentLeadFrames = 40; // 800 ms of silence at 20 ms/frame
-          await new Promise((r) => setTimeout(r, startDelayMs));
           const audio = Buffer.concat([
-            Buffer.alloc(silentLeadFrames * 160, 0xff),
-            ...frames,
+            Buffer.alloc(10 * 160, 0xff), // 200 ms lead so the SBC sees clean silence first
+            Buffer.concat(frames),
           ]);
-          // Pad with mu-law silence (0xFF) up to the requested hold time so the
-          // SBC keeps receiving continuous RTP until we send BYE.
-          const want = Math.floor((durationMs / 20) * 160);
-          const padded = audio.length >= want ? audio : Buffer.concat([audio, Buffer.alloc(want - audio.length, 0xff)]);
-          streamer = callSession.streamAudio(padded);
-          streamer.once("finished", () => steps.push("audio:finished"));
+          greetingStreamer = callSession.streamAudio(audio);
+          greetingStreamer.once("finished", () => steps.push("audio:finished"));
+        } else {
+          steps.push("audio:none");
         }
 
-        holdTimer = setTimeout(() => finish(), durationMs);
-        watchdog = setTimeout(() => fail("watchdog timeout"), durationMs + 60000);
+        // ---- Hold the call open ----
+        // Keep a continuous stream of silence so the SBC never tears the call
+        // down for lack of media. The call ends when the far side hangs up
+        // (disposed) or a generous watchdog fires. We never BYE on a fixed
+        // speakSeconds timer - that's what made calls "drop on their own".
+        const holdMs = Math.max(10000, durationMs + 120000);
+        const silence = () => {
+          if (callSession.disposed || settled) return;
+          const s = callSession.streamAudio(Buffer.alloc(300 * 160, 0xff)); // 6 s of silence
+          s.once("finished", () => { if (!callSession.disposed && !settled) setTimeout(silence, 0); });
+        };
+        holdTimer = setTimeout(silence, Math.max(0, (frames.length ? frames.length * 20 + 200 : 0) + 300));
+        watchdog = setTimeout(() => fail("watchdog timeout", "completed"), holdMs);
+        callSession.once("disposed", () => {
+          if (!result.ok) return;
+          steps.push("far-side-disposed");
+          finish();
+        });
       } catch (e) {
         const msg = (e && e.message) || String(e);
         result.outcome = msg.toLowerCase().includes("busy") ? "busy" : "error";
