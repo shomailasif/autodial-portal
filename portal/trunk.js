@@ -13,6 +13,8 @@
  *                     registration bridge lands.
  */
 const crypto = require("node:crypto");
+const tls = require("node:tls");
+const net = require("node:net");
 const { sipCallOnce } = require("./softphone");
 const audio = require("./audio");
 const learning = require("./learning");
