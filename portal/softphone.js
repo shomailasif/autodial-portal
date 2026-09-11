@@ -461,45 +461,49 @@ function sipCallOnce(o) {
         if (st.phase === "invite") {
           status = "answered";
           outcome = "answered";
-          // ACK once (200 to our INVITE)
+          // ACK once (200 to our INVITE) - immediately, before media starts.
           if (!acked) { acked = true; st.sock.write(buildAck()); steps.push("ACK"); }
+          // Always re-read the 200 OK SDP: RingCentral can relocate the RTP
+          // target / refresh the SDES key between the 183 early-media answer
+          // and the final 200 response. Streaming to a stale port deadens or
+          // chops the far-end audio even when every frame is correct.
           const body = txt.split("\r\n\r\n").slice(1).join("\r\n\r\n");
-          if (body.includes("a=crypto:1") && !media.remoteKey) {
+          if (body.includes("a=crypto:1")) {
             const sdp = parseSdp(body);
             if (sdp.ip && sdp.port && sdp.key) {
               media.remoteIp = sdp.ip; media.remotePort = sdp.port; media.remoteKey = sdp.key;
               inSrtp = new Srtp(sdp.key);
             }
           }
-          // stream the real script payloads (o.payloads = 20ms PCMU frames);
-          // tone fallback only when no audio was supplied.
-          const tones = o.payloads && Array.isArray(o.payloads) && o.payloads.length ? null : pcmuTone(160);
+          // stream the real script payloads (o.payloads = 20ms PCMU frames) one
+          // per slot with a drift-compensated scheduler; tone fallback only
+          // when no audio was supplied. Each payload goes out exactly once, in
+          // order, so a busy server delays - it never skips speech.
+          const frames = o.payloads && Array.isArray(o.payloads) && o.payloads.length ? o.payloads : null;
           const silence = Buffer.alloc(160, 0xff);
           let seq = crypto.randomBytes(2).readUInt16BE(0);
           let ts = (crypto.randomBytes(4).readUInt32BE(0));
           const start = Date.now();
-          const sendFrame = () => {
-            if (!media.remotePort || settled) return;
-            if (!acked) { acked = true; st.sock.write(buildAck()); }
-            let payload;
-            if (tones) payload = tones;
-            else {
-              const idx = Math.floor((Date.now() - start) / 20);
-              payload = idx < o.payloads.length ? o.payloads[idx] : silence;
+          let sent = 0;
+          const tick = () => {
+            if (settled || !media.remotePort) return;
+            if (Date.now() - start >= duration) {
+              st.phase = "bye";
+              if (!byeSent) { byeSent = true; st.sock.write(buildBye()); steps.push("BYE"); }
+              setTimeout(() => done(true, "answered, streamed " + duration + "ms"), 600);
+              return;
             }
-            const hdr = rtpHdr(seq, ssrc, seq === 0, ts);
+            const payload = frames ? (sent < frames.length ? frames[sent] : silence) : pcmuTone(160);
+            const hdr = rtpHdr(seq, ssrc, sent === 0, ts);
             const pkt = outSrtp.protect(hdr, payload);
             try { udp.send(pkt, 0, pkt.length, media.remotePort, media.remoteIp); } catch {}
             seq = (seq + 1) & 0xffff;
             ts = (ts + 160) >>> 0;
-            if (Date.now() - start >= duration) {
-              clearInterval(rtpTimer);
-              st.phase = "bye";
-              if (!byeSent) { byeSent = true; st.sock.write(buildBye()); steps.push("BYE"); }
-              setTimeout(() => done(true, "answered, streamed " + duration + "ms"), 600);
-            }
+            sent++;
+            const next = start + sent * 20;
+            setTimeout(tick, Math.max(0, next - Date.now()));
           };
-          rtpTimer = setInterval(sendFrame, 20);
+          tick();
           return;
         }
       }
