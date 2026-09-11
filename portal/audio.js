@@ -48,7 +48,7 @@ function toUlawFrames(pcm16) {
   const n = pcm16.length;
   for (let off = 0; off < n; off += FRAME) {
     const end = Math.min(off + FRAME, n);
-    const b = Buffer.alloc(FRAME);
+    const b = Buffer.alloc(FRAME, 0xff); // 0xFF = digital silence for G.711
     for (let i = off; i < end; i++) b[i - off] = ulawEncode(pcm16[i]);
     frames.push(b);
   }
@@ -120,6 +120,27 @@ function resampleTo8k(mono, sampleRate) {
   return Int16Array.from(out, (v) => Math.max(-32768, Math.min(32767, Math.round(v))));
 }
 
+/** MPEG decoders append encoder delay + a flat low-level tail with a hard
+ *  click/pop where the stream truncates (16-bit mono, any rate). Cut from the
+ *  end while the frame is "flat" (peak-to-peak below a quiet threshold) so a
+ *  call never ends on that garbage. Keeps a little real trailing silence. */
+function trimNoiseTail(pcm, sampleRate) {
+  if (!pcm || !pcm.length) return pcm;
+  const frame = Math.round((sampleRate || RATE) / 100); // 10 ms windows
+  let i = pcm.length;
+  let flat = 0;
+  while (i >= frame) {
+    const s = i - frame;
+    let mn = pcm[s], mx = pcm[s];
+    for (let j = s; j < i; j++) { const v = pcm[j]; if (v < mn) mn = v; else if (v > mx) mx = v; }
+    if (mx - mn > 32) break; // real signal: stop trimming
+    flat++;
+    i -= frame;
+    if (flat > 30) break; // keep max ~300 ms of trailing silence
+  }
+  return i < pcm.length ? pcm.slice(0, i + frame) : pcm;
+}
+
 /** Decode an MP3 buffer to PCM16 8kHz mono (WASM; returns null on failure). */
 async function decodeMp3(buf) {
   const mod = getDecoder();
@@ -141,7 +162,7 @@ async function decodeMp3(buf) {
     }
     dec.free();
     const pcm = Int16Array.from(mono, (v) => Math.max(-32768, Math.min(32767, Math.round(v))));
-    return resampleTo8k(pcm, rate);
+    return resampleTo8k(trimNoiseTail(pcm, rate), rate);
   } catch {
     try { if (dec) dec.free(); } catch {}
     return null;
