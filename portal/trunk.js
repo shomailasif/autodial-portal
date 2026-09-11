@@ -234,6 +234,8 @@ async function dialViaRingCentral(ctx, session, settings) {
       durationMs: talkMs,
       codec: settings.codec === "opus" ? "opus" : "pcmu",
       payloads: Array.isArray(session.audioFrames) && session.audioFrames.length ? session.audioFrames : undefined,
+      segments: Array.isArray(session.audioSegments) && session.audioSegments.length ? session.audioSegments : undefined,
+      listenAfterGreeting: settings.listen === true || settings.turnTaking === true || settings.listening === true,
     };
     // SBCs silently drop REGISTERs when the same device registers too
     // quickly from a fresh port - retry with backoff before giving up.
@@ -401,7 +403,8 @@ async function placeCall(ctx, { customer, destination }) {
   if (settings.username && settings.sipPassword) {
     try {
       session.audioFrames = await audio.framesFor(session.script || "", { ttsKey: settings.ttsKey, ttsVoice: settings.ttsVoice });
-    } catch { session.audioFrames = []; }
+      session.audioSegments = await audio.segmentsFor(session.script || "", { ttsKey: settings.ttsKey, ttsVoice: settings.ttsVoice });
+    } catch { session.audioFrames = []; session.audioSegments = []; }
   }
 
   const drivers = {

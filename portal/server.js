@@ -325,7 +325,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const frames = text ? await audio.framesFor(text, { ttsKey: b.ttsKey, ttsVoice: b.ttsVoice }) : [];
       return send(200, {
         ok: true,
-        build: "audiofix-v3",
+        build: "audiofix-v4",
         ...(lastCrash ? { crash: lastCrash.slice(0, 600) } : {}),
         text,
         frames: frames.length,

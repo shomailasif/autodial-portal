@@ -312,4 +312,28 @@ async function framesFor(text, opts = {}) {
   return frames;
 }
 
-module.exports = { framesFor, toUlawFrames, decodeWav, decodeMp3, audioToFrames, textToFrames, FRAME, SILENCE };
+/** Split a script into speakable units (one per sentence / TTS chunk) so the
+ *  caller can pause for the far side between them (turn-taking). */
+function unitize(text) {
+  const sentences = String(text || "").split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter((s) => s.length);
+  const units = [];
+  let cur = "";
+  for (const s of sentences) {
+    if ((cur + " " + s).trim().length > 180) { if (cur.trim()) units.push(cur.trim()); cur = s; }
+    else cur = (cur + " " + s).trim();
+  }
+  if (cur.trim()) units.push(cur.trim());
+  return units.length ? units : [String(text || "Hello").slice(0, 180)];
+}
+
+/** Render a script into separate μ-law frame groups (one per unit). */
+async function segmentsFor(text, opts = {}) {
+  const segs = [];
+  for (const u of unitize(text)) {
+    const f = await framesFor(u, opts);
+    if (f && f.length) segs.push(f);
+  }
+  return segs;
+}
+
+module.exports = { framesFor, segmentsFor, unitize, toUlawFrames, decodeWav, decodeMp3, audioToFrames, textToFrames, FRAME, SILENCE };
