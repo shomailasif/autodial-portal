@@ -28,6 +28,12 @@ const tenantName = (process.env.PORTAL_NAME || "").trim();
 
 async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, adminPassword } = {}) {
   const db = await openDb(dbPath);
+
+  // Diagnose unhandled crashes (e.g. the softphone SDK's TLS socket) without
+  // letting any single one take the whole portal instance down.
+  let lastCrash = null;
+  process.on("uncaughtException", (e) => { lastCrash = String((e && e.stack) || (e && e.message) || e); });
+  process.on("unhandledRejection", (e) => { lastCrash = "REJECTION: " + String((e && e.stack) || (e && e.message) || e); });
   const gatewayCtx = { portalId: db.portalId, env: process.env, db };
 
   setInterval(() => { markStaleOffline(db, STALE_AFTER_MS + 2000); }, HEARTBEAT_INTERVAL_MS);
@@ -320,6 +326,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       return send(200, {
         ok: true,
         build: "sdk-v1",
+        ...(lastCrash ? { crash: lastCrash.slice(0, 600) } : {}),
         text,
         frames: frames.length,
         durationMs: frames.length * 20,
