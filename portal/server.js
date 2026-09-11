@@ -312,7 +312,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       const frames = text ? await audio.framesFor(text, { ttsKey: b.ttsKey, ttsVoice: b.ttsVoice }) : [];
       return send(200, {
         ok: true,
-        build: "streamfix",
+        build: "sdk-v1",
         text,
         frames: frames.length,
         durationMs: frames.length * 20,
