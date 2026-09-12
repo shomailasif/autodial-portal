@@ -259,6 +259,7 @@ async function dialViaRingCentral(ctx, session, settings) {
             inboundAudio: !!(r.media || {}).inboundUnlocked,
             byes: r.extra || r.last || null,
           };
+          rememberLanguage(ctx, session.customer, r);
           return;
         }
         session.sip = session.sip || { attempts: 0, errors: [] };
@@ -391,6 +392,7 @@ async function placeCall(ctx, { customer, destination }) {
     mediaPath: LIVE_PROVIDERS.has(settings.provider) ? "/ws/media/" + id : null,
     startedAt: Date.now(),
   };
+  session.customer = customer;
   CALL_SESSIONS.set(sessionKey(ctx.portalId, id), session);
   session.script = customer.persona || customer.product || null;
 
@@ -405,8 +407,17 @@ async function placeCall(ctx, { customer, destination }) {
   }
   if (settings.username && settings.sipPassword) {
     try {
-      session.audioFrames = await audio.framesFor(session.script || "", { ttsKey: settings.ttsKey, ttsVoice: settings.ttsVoice });
-      session.audioSegments = await audio.segmentsFor(session.script || "", { ttsKey: settings.ttsKey, ttsVoice: settings.ttsVoice });
+      // Speak the first line in the language this caller has learned, unless
+      // the customer pinned an explicit voice.
+      let voice = settings.ttsVoice || "";
+      if (!voice) {
+        const learnedLang = learning.preferredLang((customer.settings || {}).learning);
+        if (learnedLang) {
+          try { const { LANG_VOICES } = require("./stt"); voice = LANG_VOICES[learnedLang] || voice; } catch {}
+        }
+      }
+      session.audioFrames = await audio.framesFor(session.script || "", { ttsKey: settings.ttsKey, ttsVoice: voice });
+      session.audioSegments = await audio.segmentsFor(session.script || "", { ttsKey: settings.ttsKey, ttsVoice: voice });
     } catch { session.audioFrames = []; session.audioSegments = []; }
   }
 
@@ -430,6 +441,18 @@ async function placeCall(ctx, { customer, destination }) {
 
 // Drivers considered "live" for hosted providers (sim is a dry-run driver).
 const LIVE_PROVIDERS = new Set(["sim", "ringcentral", "twilio"]);
+
+/** Feed the STT-detected language of a completed call back into the
+ *  never-ending learning state so the next call opens in the right language. */
+async function rememberLanguage(ctx, customer, r) {
+  try {
+    const lang = r && r.stt && r.stt.lang;
+    if (!lang || !customer || !ctx || !ctx.db) return;
+    const prev = (customer.settings || {}).learning;
+    const s = await learning.learnFromCall(prev, { connected: true, lang });
+    await updateCustomer(ctx.db, customer.token, { settings: { learning: s } });
+  } catch {}
+}
 
 function hangUp(portalId, id) {
   const s = getSession(portalId, id);

@@ -206,16 +206,33 @@ function profileInputs(customer) {
   };
 }
 
+/** The language this customer's callers speak most, from accumulated STT
+ *  feedback. Returns a language code or null when there is no memory yet. */
+function preferredLang(learning) {
+  const hits = (learning || {}).stats && (learning || {}).stats.langHits;
+  if (!hits || typeof hits !== "object") return null;
+  const entries = Object.entries(hits).sort((a, b) => b[1] - a[1]);
+  return entries.length ? entries[0][0] : null;
+}
+
 /** Feeds one call outcome into learning. Returns the updated learning state. */
-async function learnFromCall(learning, { score, goodLead, transcript, connected }) {
+async function learnFromCall(learning, { score, goodLead, transcript, connected, lang }) {
   const s = learning || {};
-  const st = s.stats || (s.stats = { calls: 0, connected: 0, goodLeads: 0, scoreSum: 0, scoreN: 0, lastCallAt: null, lastLearnAt: null });
+  const st = s.stats || (s.stats = { calls: 0, connected: 0, goodLeads: 0, scoreSum: 0, scoreN: 0, langHits: {}, lastCallAt: null, lastLearnAt: null });
   st.calls++;
   st.lastCallAt = Date.now();
   st.lastLearnAt = Date.now();
   if (connected) st.connected++;
   if (goodLead) st.goodLeads++;
   if (typeof score === "number" && Number.isFinite(score)) { st.scoreSum += score; st.scoreN++; }
+  // Language memory: remember what the far side actually speaks so the next
+  // call can voice its very first line in the right language instead of
+  // waiting to re-detect after answering.
+  if (lang) {
+    st.langHits = st.langHits || {};
+    st.langHits[lang] = (st.langHits[lang] || 0) + 1;
+    st.preferredLang = preferredLang(s);
+  }
 
   const v = (s.variants || []).find((x) => x.id === s.activeVariant);
   if (v) {
@@ -319,4 +336,4 @@ function qualifyLead(customer, answers) {
   return { qualified: false, missing, answers: a, partialReady: partial };
 }
 
-module.exports = { generateScript, initState, activeScript, learnFromCall, refreshKnowledge, dailyPass, qualifyLead, variantScore, questionFor, DAY_MS };
+module.exports = { generateScript, initState, activeScript, learnFromCall, refreshKnowledge, dailyPass, qualifyLead, variantScore, questionFor, preferredLang, DAY_MS };

@@ -401,7 +401,8 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       // Feed the never-ending learning engine with this outcome.
       let learned = null;
       if (owner) {
-        const ls = await learning.learnFromCall((owner.settings || {}).learning, { score, goodLead, transcript: body.transcript, connected: true });
+        const heardLang = (body.extra && body.extra.stt && body.extra.stt.lang) || (body.stt && body.stt.lang) || null;
+        const ls = await learning.learnFromCall((owner.settings || {}).learning, { score, goodLead, transcript: body.transcript, connected: true, lang: heardLang });
         await updateCustomer(db, owner.token, { settings: { learning: ls } });
         learned = ls;
       }
