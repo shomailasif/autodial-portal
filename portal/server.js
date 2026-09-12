@@ -106,7 +106,7 @@ async function start({ dbPath = path.join(__dirname, "portal.db"), port = 8787, 
       return send(200, { ok: true, name: c.persona }, { "Set-Cookie": `csession=${issueCustomerSession(c.token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400` });
     }
     if (url.pathname === "/clogout" && method === "POST") {
-      return send(200, { ok: true }, { "Set-Cookie": "csession=; Path=/; HttpOnly; Max-Age=0" });
+      return send(200, { ok: true }, { "Set-Cookie": ["csession=; Path=/; HttpOnly; Max-Age=0", "session=; Path=/; HttpOnly; Max-Age=0"] });
     }
     // Customer dashboard (HTML) + JSON view of their own record.
     if (url.pathname === "/my" && method === "GET") {
